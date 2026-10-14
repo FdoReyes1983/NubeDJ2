@@ -4,6 +4,9 @@
 #include <android/log.h>
 #include <oboe/Oboe.h>
 
+#include "bpm.h"
+#include "dsp.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -18,6 +21,7 @@ namespace {
 
 constexpr int kDecks = 2;
 constexpr int kBins = 1500;
+constexpr int kChunk = 1024;  // frames por bloque de DSP
 
 struct Track {
     std::vector<int16_t> pcm;  // estereo intercalado
@@ -40,9 +44,14 @@ struct Deck {
     std::atomic<bool> seekPending{false};
     std::atomic<double> seekTarget{0.0};
     std::atomic<float> level{0.f};
+    // EQ / filtro (perillas -1..1) y BPM de la pista cargada (0 = desconocido)
+    std::atomic<float> eqLow{0.f}, eqMid{0.f}, eqHigh{0.f}, filter{0.f};
+    std::atomic<float> bpm{0.f};
+    std::atomic<double> firstBeat{0.0};
     // solo hilo de audio
     double pos = 0.0;
     float rate = 0.f;
+    dj::DeckFx fx;
 };
 
 class Engine : public oboe::AudioStreamDataCallback,
@@ -78,7 +87,10 @@ public:
         std::fill(out, out + numFrames * 2, 0.f);
         const float x = std::clamp(crossfader.load(), 0.f, 1.f);
         const float gain[kDecks] = {std::cos(x * 1.5707963f), std::sin(x * 1.5707963f)};
-        for (int k = 0; k < kDecks; ++k) renderDeck(decks[k], out, numFrames, gain[k]);
+        for (int32_t off = 0; off < numFrames; off += kChunk) {
+            const int32_t n = std::min<int32_t>(kChunk, numFrames - off);
+            for (int k = 0; k < kDecks; ++k) renderDeck(decks[k], out + off * 2, n, gain[k]);
+        }
         for (int32_t i = 0; i < numFrames * 2; ++i) out[i] = std::clamp(out[i], -1.f, 1.f);
         return oboe::DataCallbackResult::Continue;
     }
@@ -117,7 +129,7 @@ private:
     void renderDeck(Deck& d, float* out, int32_t n, float cfGain) {
         std::shared_ptr<Track> t = std::atomic_load(&d.track);
         if (!t || t->frames < 2) {
-            d.level.store(0.f);
+            d.level.store(d.level.load() * 0.85f);
             return;
         }
         const bool scr = d.scratching.load();
@@ -126,7 +138,6 @@ private:
             if (!d.playing.load() && !scr) d.rate = 0.f;
         }
         const double ratio = (double)t->sampleRate / (double)outRate_;
-        const float vol = d.volume.load() * cfGain;
         float target = 0.f;
         if (scr) target = d.scratchVel.load();
         else if (d.playing.load()) target = d.tempo.load();
@@ -135,9 +146,9 @@ private:
         const int16_t* pcm = t->pcm.data();
         constexpr float k = 1.f / 32768.f;
 
+        float* tmp = tmp_;
         double pos = d.pos;
         float rate = d.rate;
-        float peak = 0.f;
         for (int32_t i = 0; i < n; ++i) {
             rate += (target - rate) * a;
             pos += (double)rate * ratio;
@@ -152,21 +163,31 @@ private:
                 }
             }
             const float g = std::min(1.f, std::fabs(rate) * 50.f);  // silencio si esta detenido
+            float l = 0.f, r = 0.f;
             if (g > 0.f) {
                 const int64_t i0 = (int64_t)pos;
                 const int64_t i1 = std::min<int64_t>(i0 + 1, t->frames - 1);
                 const float f = (float)(pos - (double)i0);
-                const float l = (pcm[i0 * 2] + (pcm[i1 * 2] - pcm[i0 * 2]) * f) * k;
-                const float r = (pcm[i0 * 2 + 1] + (pcm[i1 * 2 + 1] - pcm[i0 * 2 + 1]) * f) * k;
-                const float gl = l * vol * g, gr = r * vol * g;
-                out[2 * i] += gl;
-                out[2 * i + 1] += gr;
-                peak = std::max(peak, std::max(std::fabs(gl), std::fabs(gr)));
+                l = (pcm[i0 * 2] + (pcm[i1 * 2] - pcm[i0 * 2]) * f) * k * g;
+                r = (pcm[i0 * 2 + 1] + (pcm[i1 * 2 + 1] - pcm[i0 * 2 + 1]) * f) * k * g;
             }
+            tmp[2 * i] = l;
+            tmp[2 * i + 1] = r;
         }
         d.pos = pos;
         d.rate = rate;
         d.position.store(pos);
+
+        d.fx.process(tmp, n, (float)outRate_, d.eqLow.load(), d.eqMid.load(), d.eqHigh.load(),
+                     d.filter.load());
+
+        const float vol = d.volume.load() * cfGain;
+        float peak = 0.f;
+        for (int32_t i = 0; i < n * 2; ++i) {
+            const float v = tmp[i] * vol;
+            out[i] += v;
+            peak = std::max(peak, std::fabs(v));
+        }
         d.level.store(std::max(peak, d.level.load() * 0.85f));
     }
 
@@ -174,6 +195,7 @@ private:
     std::mutex mtx_;
     std::atomic<bool> running_{false};
     int outRate_ = 48000;
+    float tmp_[kChunk * 2];
 };
 
 std::shared_ptr<Engine> gEngine = std::make_shared<Engine>();
@@ -236,6 +258,8 @@ JNI(jboolean, loadEnd)(JNIEnv*, jobject, jint deck) {
 
     d.playing.store(false);
     d.cuePreview.store(false);
+    d.bpm.store(0.f);
+    d.firstBeat.store(0.0);
     d.cue.store(0.0);
     d.seekTarget.store(0.0);
     d.seekPending.store(true);
@@ -334,4 +358,79 @@ JNI(jfloatArray, getOverview)(JNIEnv* env, jobject, jint deck) {
     jfloatArray arr = env->NewFloatArray(n);
     if (n > 0) env->SetFloatArrayRegion(arr, 0, n, t->overview.data());
     return arr;
+}
+
+// ---- EQ / filtro (perillas -1..1, 0 = plano) ----
+JNI(void, setEq)(JNIEnv*, jobject, jint deck, jfloat low, jfloat mid, jfloat high) {
+    if (!validDeck(deck)) return;
+    Deck& d = gEngine->decks[deck];
+    d.eqLow.store(std::clamp(low, -1.f, 1.f));
+    d.eqMid.store(std::clamp(mid, -1.f, 1.f));
+    d.eqHigh.store(std::clamp(high, -1.f, 1.f));
+}
+JNI(void, setFilter)(JNIEnv*, jobject, jint deck, jfloat v) {
+    if (validDeck(deck)) gEngine->decks[deck].filter.store(std::clamp(v, -1.f, 1.f));
+}
+
+// ---- BPM ----
+// Analiza la pista cargada (puede tardar unos segundos: llamar fuera del hilo de la UI).
+// Devuelve {bpm, primerBeatSegundos}; bpm = 0 si no se pudo detectar.
+JNI(jfloatArray, analyzeBpm)(JNIEnv* env, jobject, jint deck) {
+    float res[2] = {0.f, 0.f};
+    if (validDeck(deck)) {
+        std::shared_ptr<Track> t = std::atomic_load(&gEngine->decks[deck].track);
+        if (t) {
+            const dj::BpmResult r = dj::analyzeBpm(t->pcm.data(), t->frames, t->sampleRate);
+            res[0] = r.bpm;
+            res[1] = (float)r.firstBeat;
+        }
+    }
+    jfloatArray arr = env->NewFloatArray(2);
+    env->SetFloatArrayRegion(arr, 0, 2, res);
+    return arr;
+}
+JNI(void, setBpm)(JNIEnv*, jobject, jint deck, jfloat bpm, jdouble firstBeat) {
+    if (!validDeck(deck)) return;
+    gEngine->decks[deck].bpm.store(bpm);
+    gEngine->decks[deck].firstBeat.store(firstBeat);
+}
+JNI(jfloat, getBpm)(JNIEnv*, jobject, jint deck) {
+    return validDeck(deck) ? gEngine->decks[deck].bpm.load() : 0.f;
+}
+JNI(jdouble, getFirstBeat)(JNIEnv*, jobject, jint deck) {
+    return validDeck(deck) ? gEngine->decks[deck].firstBeat.load() : 0.0;
+}
+
+// SYNC de un solo toque: iguala el tempo de `deck` al del otro deck y, si ambos suenan,
+// alinea tambien los beats. Devuelve el nuevo factor de tempo, o -1 si falta el BPM de alguno.
+JNI(jfloat, syncDeck)(JNIEnv*, jobject, jint deck) {
+    if (!validDeck(deck)) return -1.f;
+    Deck& d = gEngine->decks[deck];
+    Deck& o = gEngine->decks[1 - deck];
+    const float bOwn = d.bpm.load(), bOth = o.bpm.load();
+    if (bOwn <= 0.f || bOth <= 0.f) return -1.f;
+
+    float r = bOth * o.tempo.load() / bOwn;
+    bool octave = false;  // p.ej. 77 BPM contra 154 BPM: se iguala a la octava mas cercana
+    while (r > 1.41f) { r *= 0.5f; octave = true; }
+    while (r < 0.71f) { r *= 2.f; octave = true; }
+    r = std::clamp(r, 0.5f, 1.5f);
+    d.tempo.store(r);
+
+    std::shared_ptr<Track> tr = std::atomic_load(&d.track);
+    std::shared_ptr<Track> to = std::atomic_load(&o.track);
+    if (!octave && tr && to && d.playing.load() && o.playing.load()) {
+        const double perO = 60.0 / bOth, perD = 60.0 / bOwn;
+        const double posO = o.position.load() / to->sampleRate;
+        const double posD = d.position.load() / tr->sampleRate;
+        double fo = (posO - o.firstBeat.load()) / perO;
+        double fd = (posD - d.firstBeat.load()) / perD;
+        fo -= std::floor(fo);
+        fd -= std::floor(fd);
+        double diff = fd - fo;
+        if (diff > 0.5) diff -= 1.0;
+        if (diff < -0.5) diff += 1.0;
+        gEngine->seekFrames(deck, (posD - diff * perD) * tr->sampleRate);
+    }
+    return r;
 }

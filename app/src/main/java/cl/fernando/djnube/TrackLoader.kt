@@ -38,6 +38,12 @@ object TrackLoader {
         val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else 0L
         val mime = format.getString(MediaFormat.KEY_MIME)!!
 
+        // La pista se decodifica completa a PCM en memoria (~10 MB por minuto), asi que se pone un limite.
+        if (durationUs > MAX_DURATION_US) {
+            extractor.release()
+            error("La pista dura ${durationUs / 60_000_000L} min; el maximo es ${MAX_DURATION_US / 60_000_000L} min")
+        }
+
         val codec = MediaCodec.createDecoderByType(mime)
         codec.configure(format, null, null, 0)
         codec.start()
@@ -108,8 +114,14 @@ object TrackLoader {
         }
 
         check(begun && NativeEngine.loadEnd(deck)) { "No se pudo decodificar el audio" }
+
+        // BPM y primer beat (tarda de ~1 a 3 s segun el largo de la pista); bpm = 0 si no se detecta
+        val bpm = NativeEngine.analyzeBpm(deck)
+        NativeEngine.setBpm(deck, bpm[0], bpm[1].toDouble())
         return title
     }
+
+    private const val MAX_DURATION_US = 15L * 60L * 1_000_000L
 
     private fun displayName(ctx: Context, uri: Uri): String {
         ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->

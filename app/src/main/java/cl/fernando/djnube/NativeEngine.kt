@@ -29,4 +29,21 @@ object NativeEngine {
     external fun getDurationSeconds(deck: Int): Double
     external fun getLevel(deck: Int): Float
     external fun getOverview(deck: Int): FloatArray
+
+    /** EQ de 3 bandas y filtro DJ. Perillas de -1 a 1 (0 = plano; en el EQ -1 = anular la banda). */
+    external fun setEq(deck: Int, low: Float, mid: Float, high: Float)
+    /** Filtro DJ: -1 = pasa-bajos cerrado, 0 = apagado, +1 = pasa-altos cerrado. */
+    external fun setFilter(deck: Int, v: Float)
+
+    /** Analiza la pista cargada. Devuelve [bpm, primerBeatEnSegundos]; bpm = 0 si no lo detecta. */
+    external fun analyzeBpm(deck: Int): FloatArray
+    external fun setBpm(deck: Int, bpm: Float, firstBeat: Double)
+    external fun getBpm(deck: Int): Float
+    external fun getFirstBeat(deck: Int): Double
+
+    /**
+     * SYNC de un toque: iguala el tempo de [deck] al del otro deck y, si ambos suenan, alinea los beats.
+     * Devuelve el nuevo factor de tempo (1.0 = sin cambio) o -1 si falta el BPM de alguno de los decks.
+     */
+    external fun syncDeck(deck: Int): Float
 }
