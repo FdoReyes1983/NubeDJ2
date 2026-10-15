@@ -9,6 +9,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
@@ -64,6 +65,10 @@ class DeckState(val index: Int) {
     var analyzing by mutableStateOf(false)      // BPM calculandose en segundo plano
     var loadGen = 0                             // se incrementa en cada carga: descarta analisis viejos
     var overview by mutableStateOf<FloatArray?>(null)
+    var detail by mutableStateOf<FloatArray?>(null)   // 4 valores por bin de 5 ms: total, graves, medios, agudos
+    var firstBeat by mutableDoubleStateOf(0.0)
+    var pendingSync by mutableStateOf(false)    // SYNC pedido mientras se calculaba el BPM
+    var zoomSec by mutableFloatStateOf(6f)      // segundos visibles en el waveform ampliado
     var position by mutableDoubleStateOf(0.0)
     var duration by mutableDoubleStateOf(0.0)
     var playing by mutableStateOf(false)
@@ -84,6 +89,7 @@ class DeckState(val index: Int) {
         playing = NativeEngine.isPlaying(index)
         level = NativeEngine.getLevel(index)
         bpm = NativeEngine.getBpm(index)
+        firstBeat = NativeEngine.getFirstBeat(index)
     }
 
     fun pushEq() = NativeEngine.setEq(index, eqLow, eqMid, eqHigh)
@@ -96,10 +102,20 @@ private fun applyTempo(d: DeckState) = NativeEngine.setTempo(d.index, 1f + d.tem
 private fun deckLetter(d: DeckState) = if (d.index == 0) "A" else "B"
 
 /** Iguala el tempo (y los beats, si ambos suenan) de [d] al otro deck. */
-private fun doSync(d: DeckState, say: (String) -> Unit) {
+private fun doSync(d: DeckState, other: DeckState, say: (String) -> Unit) {
+    if (d.analyzing || other.analyzing || (d.bpm <= 0f && d.loading) || (other.bpm <= 0f && other.loading)) {
+        // el BPM todavia se esta calculando: el SYNC queda pendiente y se aplica solo al terminar
+        d.pendingSync = true
+        say("Calculando BPM… el SYNC se aplicara solo en un momento")
+        return
+    }
+    d.pendingSync = false
     val r = NativeEngine.syncDeck(d.index)
     if (r < 0f) {
-        say("SYNC necesita el BPM de los dos decks (usa TAP si no se detecto)")
+        say(
+            if (NativeEngine.getBpm(d.index) <= 0f) "Deck ${deckLetter(d)} sin BPM: usa TAP"
+            else "El otro deck no tiene pista o BPM para sincronizar"
+        )
         return
     }
     val pct = (r - 1f) * 100f
@@ -186,10 +202,15 @@ fun DjApp() {
                     d.loading = true
                     val gen = ++d.loadGen
                     d.analyzing = false
+                    d.pendingSync = false
+                    d.detail = null
+                    val t0 = SystemClock.elapsedRealtime()
                     try {
                         val title = withContext(Dispatchers.Default) { TrackLoader.load(ctx, uri, d.index) }
                         d.name = title
                         d.overview = NativeEngine.getOverview(d.index)
+                        d.detail = NativeEngine.getDetail(d.index)
+                        say("Cargada en ${"%.1f".format((SystemClock.elapsedRealtime() - t0) / 1000f)} s")
                         d.taps.clear()
                         d.tempoPct = 0f
                         NativeEngine.setTempo(d.index, 1f)
@@ -200,6 +221,8 @@ fun DjApp() {
                         if (gen == d.loadGen) {
                             if (NativeEngine.getBpm(d.index) == 0f) NativeEngine.setBpm(d.index, r[0], r[1].toDouble())
                             d.analyzing = false
+                            // SYNC pedido mientras se calculaba: se aplica ahora (de cualquiera de los dos decks)
+                            for (x in decks) if (x.pendingSync) doSync(x, decks[1 - x.index], say)
                         }
                     } catch (e: Exception) {
                         say("Error al cargar: ${e.message}")
@@ -216,7 +239,7 @@ fun DjApp() {
                 Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(6.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                DeckPanel(decks[0], CYAN, Modifier.weight(1f), say) { pickers[0].launch(arrayOf("audio/*")) }
+                DeckPanel(decks[0], decks[1], CYAN, Modifier.weight(1f), say) { pickers[0].launch(arrayOf("audio/*")) }
                 Mixer(
                     decks, crossfader,
                     onCrossfader = { crossfader = it; NativeEngine.setCrossfader(it) },
@@ -226,7 +249,7 @@ fun DjApp() {
                     },
                     modifier = Modifier.width(250.dp)
                 )
-                DeckPanel(decks[1], PINK, Modifier.weight(1f), say) { pickers[1].launch(arrayOf("audio/*")) }
+                DeckPanel(decks[1], decks[0], PINK, Modifier.weight(1f), say) { pickers[1].launch(arrayOf("audio/*")) }
             }
             message?.let {
                 Text(
@@ -241,7 +264,7 @@ fun DjApp() {
 }
 
 @Composable
-fun DeckPanel(d: DeckState, accent: Color, modifier: Modifier, say: (String) -> Unit, onLoad: () -> Unit) {
+fun DeckPanel(d: DeckState, other: DeckState, accent: Color, modifier: Modifier, say: (String) -> Unit, onLoad: () -> Unit) {
     Column(
         modifier.fillMaxHeight().clip(RoundedCornerShape(10.dp)).background(PANEL).padding(8.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp)
@@ -258,7 +281,8 @@ fun DeckPanel(d: DeckState, accent: Color, modifier: Modifier, say: (String) -> 
                 modifier = Modifier.height(32.dp)
             ) { Text("LOAD", fontSize = 12.sp) }
         }
-        Waveform(d, accent, Modifier.fillMaxWidth().height(56.dp))
+        ZoomWave(d, accent, Modifier.fillMaxWidth().height(64.dp))
+        Waveform(d, accent, Modifier.fillMaxWidth().height(24.dp))
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(
                 "${fmt(d.position)} / ${fmt(d.duration)}", color = MUTED, fontSize = 12.sp,
@@ -292,7 +316,7 @@ fun DeckPanel(d: DeckState, accent: Color, modifier: Modifier, say: (String) -> 
                         )
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        SmallButton("SYNC", accent, Modifier.weight(1.5f).height(34.dp), filled = true) { doSync(d, say) }
+                        SmallButton("SYNC", accent, Modifier.weight(1.5f).height(34.dp), filled = true) { doSync(d, other, say) }
                         SmallButton("÷2", accent, Modifier.weight(1f).height(34.dp)) { scaleBpm(d, 0.5f) }
                         SmallButton("×2", accent, Modifier.weight(1f).height(34.dp)) { scaleBpm(d, 2f) }
                     }
@@ -306,10 +330,10 @@ fun DeckPanel(d: DeckState, accent: Color, modifier: Modifier, say: (String) -> 
                         }
                     }
                     val rg = d.range.toFloat()
-                    Text(
-                        "PITCH ${"%+.1f".format(d.tempoPct)}%", color = MUTED, fontSize = 11.sp,
-                        modifier = Modifier.clickable { d.tempoPct = 0f; applyTempo(d) }
-                    )
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("PITCH ${"%+.1f".format(d.tempoPct)}%", color = MUTED, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                        SmallButton("RESET", YELLOW, Modifier.width(64.dp).height(24.dp)) { d.tempoPct = 0f; applyTempo(d) }
+                    }
                     Slider(
                         value = d.tempoPct.coerceIn(-rg, rg), valueRange = -rg..rg,
                         onValueChange = { d.tempoPct = it; applyTempo(d) },
@@ -400,6 +424,97 @@ fun Waveform(d: DeckState, accent: Color, modifier: Modifier) {
             }
         }
         drawLine(Color.White, Offset(prog * w, 0f), Offset(prog * w, h), 2f)
+    }
+}
+
+/**
+ * Waveform ampliado: ventana de unos segundos centrada en el cabezal, con 3 bandas de color
+ * (graves = color del deck, medios = mas claro, agudos = blanco) y la cuadricula de beats.
+ * Arrastrar = mover la pista; doble toque = cambiar el zoom (3 / 6 / 12 s).
+ */
+@Composable
+fun ZoomWave(d: DeckState, accent: Color, modifier: Modifier) {
+    Canvas(
+        modifier.clip(RoundedCornerShape(6.dp)).background(Color(0xFF05080F))
+            .pointerInput(d) {
+                detectTapGestures(onDoubleTap = {
+                    d.zoomSec = when { d.zoomSec <= 3.5f -> 6f; d.zoomSec <= 7f -> 12f; else -> 3f }
+                })
+            }
+            .pointerInput(d) {
+                detectHorizontalDragGestures { change, dx ->
+                    change.consume()
+                    if (d.duration > 0) {
+                        val secPerPx = d.zoomSec / size.width
+                        NativeEngine.seekSeconds(d.index, (d.position - dx * secPerPx).coerceIn(0.0, d.duration))
+                    }
+                }
+            }
+    ) {
+        val w = size.width
+        val h = size.height
+        val mid = h / 2f
+        val span = d.zoomSec
+        val pos = d.position
+        val det = d.detail
+        val t0 = pos - span / 2.0
+        val low = accent
+        val med = Color(
+            red = accent.red + (1f - accent.red) * 0.55f,
+            green = accent.green + (1f - accent.green) * 0.55f,
+            blue = accent.blue + (1f - accent.blue) * 0.55f
+        )
+        if (det != null && det.size >= 8 && d.duration > 0) {
+            val nb = det.size / 4
+            val rate = nb / d.duration                       // bins por segundo (~200)
+            val cols = w.toInt() / 2                         // columnas de 2 px: mitad de trabajo de dibujo
+            val binsPerCol = span * rate / cols
+            val cw = w / cols
+            for (x in 0 until cols) {
+                val ts = t0 + span * x / cols
+                val b0 = (ts * rate).toInt()
+                val b1 = max(b0 + 1, (ts * rate + binsPerCol).toInt())
+                if (b1 <= 0 || b0 >= nb) continue
+                var pf = 0f; var pl = 0f; var pm = 0f; var ph = 0f
+                for (b in max(0, b0) until minOf(nb, b1)) {
+                    val o = b * 4
+                    if (det[o] > pf) pf = det[o]
+                    if (det[o + 1] > pl) pl = det[o + 1]
+                    if (det[o + 2] > pm) pm = det[o + 2]
+                    if (det[o + 3] > ph) ph = det[o + 3]
+                }
+                // raiz para que los golpes suaves tambien se vean, pero los picos sigan sobresaliendo
+                val hf = sqrt(pf) * mid * 0.96f
+                val hl = sqrt(pl) * mid * 0.96f
+                val hm = sqrt(pm) * mid * 0.96f
+                val hh = sqrt(ph) * mid * 0.96f
+                val xx = (x + 0.5f) * cw
+                drawLine(low.copy(alpha = 0.28f), Offset(xx, mid - hf), Offset(xx, mid + hf), cw + 0.3f)
+                drawLine(low, Offset(xx, mid - hl), Offset(xx, mid + hl), cw + 0.3f)
+                drawLine(med, Offset(xx, mid - hm), Offset(xx, mid + hm), cw + 0.3f)
+                drawLine(Color.White.copy(alpha = 0.9f), Offset(xx, mid - hh), Offset(xx, mid + hh), cw + 0.3f)
+            }
+        }
+        // cuadricula de beats (en tiempo de pista; la linea mas gruesa marca cada 4 beats)
+        if (d.bpm > 0f && d.duration > 0) {
+            val per = 60.0 / d.bpm
+            var k = Math.floor((t0 - d.firstBeat) / per).toLong()
+            while (true) {
+                val tb = d.firstBeat + k * per
+                if (tb > t0 + span) break
+                if (tb >= t0 && tb >= 0) {
+                    val x = ((tb - t0) / span * w).toFloat()
+                    val bar = Math.floorMod(k, 4L) == 0L
+                    drawLine(
+                        Color.White.copy(alpha = if (bar) 0.75f else 0.30f),
+                        Offset(x, 0f), Offset(x, h), if (bar) 2.5f else 1f
+                    )
+                }
+                k++
+            }
+        }
+        drawLine(Color.White, Offset(w / 2f, 0f), Offset(w / 2f, h), 2.5f)
+        drawLine(Color(0xFFE53935), Offset(w / 2f - 6f, 0f), Offset(w / 2f + 6f, 0f), 4f)
     }
 }
 

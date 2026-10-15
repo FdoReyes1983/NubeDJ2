@@ -28,6 +28,7 @@ struct Track {
     int sampleRate = 44100;
     int64_t frames = 0;
     std::vector<float> overview;
+    std::vector<float> detail;   // 4 valores por bin de 5 ms: total, graves, medios, agudos (0..1)
 };
 
 struct Deck {
@@ -256,6 +257,39 @@ JNI(jboolean, loadEnd)(JNIEnv*, jobject, jint deck) {
     }
     if (gmax > 0.f) for (auto& v : t->overview) v /= gmax;
 
+    {   // Waveform de detalle: picos por bin de 5 ms en 3 bandas (graves < 200 Hz, medios, agudos > 2.5 kHz)
+        const int hop = std::max(1, t->sampleRate / 200);
+        const int64_t nb = t->frames / hop;
+        t->detail.assign((size_t)nb * 4, 0.f);
+        const float a1 = 1.f - std::exp(-2.f * 3.14159265f * 200.f / (float)t->sampleRate);
+        const float a2 = 1.f - std::exp(-2.f * 3.14159265f * 2500.f / (float)t->sampleRate);
+        float l1 = 0.f, l2 = 0.f;
+        for (int64_t b = 0; b < nb; ++b) {
+            float pf = 0.f, pl = 0.f, pm = 0.f, ph = 0.f;
+            const int16_t* q = pcm + (b * hop) * 2;
+            for (int i = 0; i < hop; ++i) {
+                const float x = 0.5f * ((float)q[2 * i] + (float)q[2 * i + 1]) * (1.f / 32768.f);
+                l1 += a1 * (x - l1);
+                l2 += a2 * (x - l2);
+                pf = std::max(pf, std::fabs(x));
+                pl = std::max(pl, std::fabs(l1));
+                pm = std::max(pm, std::fabs(l2 - l1));
+                ph = std::max(ph, std::fabs(x - l2));
+            }
+            float* o = &t->detail[(size_t)b * 4];
+            o[0] = pf; o[1] = pl; o[2] = pm; o[3] = ph;
+        }
+        // normalizar con el percentil 98 del total: los picos se ven grandes sin que un solo golpe aplaste el resto
+        if (nb > 0) {
+            std::vector<float> tot((size_t)nb);
+            for (int64_t b = 0; b < nb; ++b) tot[b] = t->detail[(size_t)b * 4];
+            const size_t k = (size_t)((double)nb * 0.98);
+            std::nth_element(tot.begin(), tot.begin() + std::min<size_t>(k, tot.size() - 1), tot.end());
+            const float norm = std::max(1e-4f, tot[std::min<size_t>(k, tot.size() - 1)]);
+            for (auto& v : t->detail) v = std::min(1.f, v / norm);
+        }
+    }
+
     d.playing.store(false);
     d.cuePreview.store(false);
     d.bpm.store(0.f);
@@ -357,6 +391,15 @@ JNI(jfloatArray, getOverview)(JNIEnv* env, jobject, jint deck) {
     const jsize n = t ? (jsize)t->overview.size() : 0;
     jfloatArray arr = env->NewFloatArray(n);
     if (n > 0) env->SetFloatArrayRegion(arr, 0, n, t->overview.data());
+    return arr;
+}
+
+JNI(jfloatArray, getDetail)(JNIEnv* env, jobject, jint deck) {
+    std::shared_ptr<Track> t;
+    if (validDeck(deck)) t = std::atomic_load(&gEngine->decks[deck].track);
+    const jsize n = t ? (jsize)t->detail.size() : 0;
+    jfloatArray arr = env->NewFloatArray(n);
+    if (n > 0) env->SetFloatArrayRegion(arr, 0, n, t->detail.data());
     return arr;
 }
 
