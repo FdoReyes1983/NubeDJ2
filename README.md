@@ -1,4 +1,4 @@
-# Nube DJ 2 (v0.2.0)
+# Nube DJ 2 (v0.2.1)
 
 App DJ Android con motor de audio propio en C++ (Oboe, baja latencia).
 
@@ -11,6 +11,7 @@ App DJ Android con motor de audio propio en C++ (Oboe, baja latencia).
 - **BPM automático** al cargar la pista, con el primer beat. Botones ÷2 / ×2 por si detecta la
   octava equivocada (por ejemplo 154 en vez de 77), TAP para fijarlo a mano y SET para marcar un beat.
 - **SYNC**: iguala el tempo al otro deck y, si ambos suenan, alinea también los beats.
+- v0.2.1: BPM mucho más preciso (ya no confunde 117 con 78 en reggaetón/dembow) y la pista suena al tiro: el BPM se calcula en segundo plano (muestra «…»).
 - Rango de pitch seleccionable (±8 / ±16 / ±50 %).
 
 ## Compilar

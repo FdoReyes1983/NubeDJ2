@@ -61,6 +61,8 @@ private val RANGES = listOf(8, 16, 50)  // rango del pitch en %
 class DeckState(val index: Int) {
     var name by mutableStateOf("Sin pista")
     var loading by mutableStateOf(false)
+    var analyzing by mutableStateOf(false)      // BPM calculandose en segundo plano
+    var loadGen = 0                             // se incrementa en cada carga: descarta analisis viejos
     var overview by mutableStateOf<FloatArray?>(null)
     var position by mutableDoubleStateOf(0.0)
     var duration by mutableDoubleStateOf(0.0)
@@ -182,6 +184,8 @@ fun DjApp() {
             rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                 if (uri != null) scope.launch {
                     d.loading = true
+                    val gen = ++d.loadGen
+                    d.analyzing = false
                     try {
                         val title = withContext(Dispatchers.Default) { TrackLoader.load(ctx, uri, d.index) }
                         d.name = title
@@ -189,12 +193,20 @@ fun DjApp() {
                         d.taps.clear()
                         d.tempoPct = 0f
                         NativeEngine.setTempo(d.index, 1f)
+                        if (gen == d.loadGen) d.loading = false
+                        // BPM en segundo plano: la pista ya suena, el BPM aparece cuando termina
+                        d.analyzing = true
+                        val r = withContext(Dispatchers.Default) { NativeEngine.analyzeBpm(d.index) }
+                        if (gen == d.loadGen) {
+                            if (NativeEngine.getBpm(d.index) == 0f) NativeEngine.setBpm(d.index, r[0], r[1].toDouble())
+                            d.analyzing = false
+                        }
                     } catch (e: Exception) {
                         say("Error al cargar: ${e.message}")
                     } catch (e: OutOfMemoryError) {
                         say("Memoria insuficiente para esta pista")
                     }
-                    d.loading = false
+                    if (gen == d.loadGen) { d.loading = false; d.analyzing = false }
                 }
             }
         }
@@ -238,7 +250,7 @@ fun DeckPanel(d: DeckState, accent: Color, modifier: Modifier, say: (String) -> 
             Text("DECK ${deckLetter(d)}", color = accent, fontWeight = FontWeight.Bold)
             Spacer(Modifier.width(8.dp))
             Text(
-                if (d.loading) "Cargando y analizando…" else d.name, color = Color.White, fontSize = 14.sp,
+                if (d.loading) "Cargando…" else d.name, color = Color.White, fontSize = 14.sp,
                 maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
             )
             OutlinedButton(
@@ -254,7 +266,7 @@ fun DeckPanel(d: DeckState, accent: Color, modifier: Modifier, say: (String) -> 
             )
             Text("BPM ", color = MUTED, fontSize = 11.sp)
             Text(
-                if (d.bpm > 0f) "%.1f".format(d.bpm * (1f + d.tempoPct / 100f)) else "--",
+                if (d.bpm > 0f) "%.1f".format(d.bpm * (1f + d.tempoPct / 100f)) else if (d.analyzing) "…" else "--",
                 color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold
             )
         }
@@ -448,8 +460,8 @@ fun Mixer(
 ) {
     BoxWithConstraints(modifier.fillMaxHeight().clip(RoundedCornerShape(10.dp)).background(PANEL).padding(6.dp)) {
         val bottom = 128.dp  // alto reservado para volumenes, crossfader y RESET
-        val cell = ((maxHeight - bottom) / 4).coerceIn(34.dp, 58.dp)
-        val knob = cell - 14.dp
+        val cell = ((maxHeight - bottom) / 4).coerceIn(40.dp, 62.dp)
+        val knob = cell - 19.dp
         Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
             Row(Modifier.fillMaxWidth().height(cell * 4), horizontalArrangement = Arrangement.SpaceBetween) {
                 KnobColumn(decks[0], CYAN, knob, cell, Modifier.weight(1f))
@@ -557,7 +569,7 @@ fun Knob(value: Float, onChange: (Float) -> Unit, label: String, color: Color, d
                 strokeWidth = stroke * 0.5f, cap = StrokeCap.Round
             )
         }
-        Text(label, color = MUTED, fontSize = 10.sp, maxLines = 1)
+        Text(label, color = MUTED, fontSize = 9.sp, lineHeight = 10.sp, maxLines = 1)
     }
 }
 

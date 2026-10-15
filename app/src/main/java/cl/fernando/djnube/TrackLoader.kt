@@ -71,7 +71,8 @@ object TrackLoader {
                         }
                     }
                 }
-                val ob = codec.dequeueOutputBuffer(info, 10_000)
+                // mientras haya entrada pendiente no se espera por la salida (la espera la hace dequeueInputBuffer)
+                val ob = codec.dequeueOutputBuffer(info, if (inputDone) 10_000 else 0)
                 when {
                     ob >= 0 -> {
                         if (info.size > 0) {
@@ -115,9 +116,8 @@ object TrackLoader {
 
         check(begun && NativeEngine.loadEnd(deck)) { "No se pudo decodificar el audio" }
 
-        // BPM y primer beat (tarda de ~1 a 3 s segun el largo de la pista); bpm = 0 si no se detecta
-        val bpm = NativeEngine.analyzeBpm(deck)
-        NativeEngine.setBpm(deck, bpm[0], bpm[1].toDouble())
+        // El BPM se calcula aparte (en segundo plano) para que la pista se pueda tocar al tiro.
+        NativeEngine.setBpm(deck, 0f, 0.0)
         return title
     }
 

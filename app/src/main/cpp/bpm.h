@@ -18,8 +18,14 @@ inline BpmResult analyzeBpm(const int16_t* pcm, int64_t frames, int sr) {
     BpmResult res;
     const int hop = std::max(1, sr / 200);            // 200 cuadros de envolvente por segundo
     const double fps = (double)sr / hop;
-    const int64_t n = frames / hop;
-    if (n < (int64_t)(fps * 8.0)) return res;         // menos de 8 s: no se analiza
+    if (frames / hop < (int64_t)(fps * 8.0)) return res;   // menos de 8 s: no se analiza
+
+    // Solo se analiza una ventana de ~75 s del centro de la pista (evita intros/outros y baja el costo
+    // a un valor fijo sin importar el largo). El tempo se asume constante.
+    const int64_t winFrames = std::min<int64_t>(frames, (int64_t)sr * 75);
+    const int64_t start = ((frames - winFrames) / 2 / hop) * hop;
+    pcm += start * 2;
+    const int64_t n = winFrames / hop;
 
     // 1) Envolventes: graves (LP 200 Hz) y transitorios (|x[i]-x[i-1]|)
     std::vector<float> e1((size_t)n), e2((size_t)n);
@@ -56,6 +62,7 @@ inline BpmResult analyzeBpm(const int16_t* pcm, int64_t frames, int sr) {
     };
     flux(e1);
     flux(e2);
+    std::vector<float> lowFlux(e1);                   // solo graves, para desempatar el tempo
     // Los graves (bombo) pesan 2.5x: el bombo ancla el beat y evita confundirlo con golpes
     // sincopados de caja/hi-hat (p.ej. dembow o cumbia, donde salia 4/3 del tempo real).
     std::vector<float> o((size_t)n, 0.f);
@@ -71,29 +78,49 @@ inline BpmResult analyzeBpm(const int16_t* pcm, int64_t frames, int sr) {
     std::vector<float> oc((size_t)n);
     for (int64_t i = 0; i < n; ++i) oc[i] = o[i] - (float)mean;
 
-    // 3) Autocorrelacion entre 70 y 180 BPM, con un leve sesgo hacia ~100 BPM
+    // 3) Autocorrelacion (señal completa y solo graves) entre 70 y 180 BPM.
+    //    Un tempo se puntua con la correlacion a 1, 2 y 4 periodos (beat, 2 beats, compas), con peso
+    //    1, 1/2, 1/4, multiplicada por la correlacion de los graves al cuadrado: el bombo decide.
+    //    Asi se evitan los errores tipicos del dembow/reggaeton (caja 3-3-2): 2/3, 3/2 y 4/3 del tempo real.
     const int lagMin = std::max(2, (int)(fps * 60.0 / 180.0));
     const int lagMax = (int)(fps * 60.0 / 70.0) + 1;
-    if ((int64_t)lagMax + 2 >= n) return res;
-    std::vector<double> ac((size_t)lagMax + 2, 0.0);
-    for (int lag = lagMin - 1; lag <= lagMax + 1; ++lag) {
-        double s = 0.0;
-        for (int64_t i = 0; i + lag < n; ++i) s += (double)oc[i] * (double)oc[i + lag];
-        ac[lag] = s / (double)(n - lag);
-    }
+    const int acMax = lagMax * 4 + 2;
+    if ((int64_t)acMax + 2 >= n) return res;
+    auto autocorr = [&](const std::vector<float>& v) {
+        double m = 0.0;
+        for (float x : v) m += x;
+        m /= (double)n;
+        std::vector<float> c((size_t)n);
+        for (int64_t i = 0; i < n; ++i) c[i] = v[i] - (float)m;
+        std::vector<double> r((size_t)acMax + 2, 0.0);
+        for (int lag = lagMin - 1; lag <= acMax; ++lag) {
+            double s = 0.0;
+            for (int64_t i = 0; i + lag < n; ++i) s += (double)c[i] * (double)c[i + lag];
+            r[lag] = s / (double)(n - lag);
+        }
+        return r;
+    };
+    const std::vector<double> ac = autocorr(o);
+    const std::vector<double> acL = autocorr(lowFlux);
+    auto at = [](const std::vector<double>& r, double lag) {   // interpolacion lineal (lag fraccionario)
+        const int i = (int)lag;
+        const double f = lag - i;
+        return r[i] * (1.0 - f) + r[i + 1] * f;
+    };
     int bestLag = -1;
     double bestVal = 0.0;
     for (int lag = lagMin; lag <= lagMax; ++lag) {
+        double q = 0.0, ql = 0.0;
+        for (int k = 1; k <= 4; k *= 2) {
+            q += std::max(0.0, at(ac, lag * (double)k)) / k;
+            ql += std::max(0.0, at(acL, lag * (double)k)) / k;
+        }
         const double bpm = 60.0 * fps / lag;
-        const double z = std::log2(bpm / 100.0) / 0.7;
-        const double v = ac[lag] * std::exp(-0.5 * z * z);
+        const double z = std::log2(bpm / 110.0) / 0.9;      // sesgo suave hacia ~110 BPM
+        const double v = q * ql * ql * std::exp(-0.5 * z * z);
         if (v > bestVal) { bestVal = v; bestLag = lag; }
     }
     if (bestLag < 0) return res;
-    {   // corregir el error "cada 3 beats": si a 2/3 del lag la correlacion es casi igual, ese es el tempo real
-        const int alt = (int)std::lround(bestLag * 2.0 / 3.0);
-        if (alt >= lagMin && alt <= lagMax && ac[alt] >= 0.9 * ac[bestLag] && ac[alt] > 0.0) bestLag = alt;
-    }
     double lagF = bestLag;
     {
         const double y0 = ac[bestLag - 1], y1 = ac[bestLag], y2 = ac[bestLag + 1];
@@ -122,7 +149,12 @@ inline BpmResult analyzeBpm(const int16_t* pcm, int64_t frames, int sr) {
         }
     }
     res.bpm = (float)bestBpm;
-    res.firstBeat = (bestPh + 0.5) / fps;
+    // llevar la fase de la ventana al inicio de la pista: primer beat dentro de [0, periodo)
+    const double period = 60.0 / bestBpm;
+    double fb = (bestPh + 0.5) / fps + (double)start / sr;
+    fb = std::fmod(fb, period);
+    if (fb < 0) fb += period;
+    res.firstBeat = fb;
     return res;
 }
 
