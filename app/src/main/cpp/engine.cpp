@@ -6,6 +6,7 @@
 
 #include "bpm.h"
 #include "dsp.h"
+#include "fx.h"
 
 #include <algorithm>
 #include <atomic>
@@ -49,10 +50,17 @@ struct Deck {
     std::atomic<float> eqLow{0.f}, eqMid{0.f}, eqHigh{0.f}, filter{0.f};
     std::atomic<float> bpm{0.f};
     std::atomic<double> firstBeat{0.0};
+    // loop (en frames de la pista) y efecto activo (tipo, encendido, X, Y del pad)
+    std::atomic<bool> loopOn{false};
+    std::atomic<double> loopStart{0.0}, loopEnd{0.0};
+    std::atomic<int> fxType{1};
+    std::atomic<bool> fxOn{false};
+    std::atomic<float> fxX{0.5f}, fxY{0.5f};
     // solo hilo de audio
     double pos = 0.0;
     float rate = 0.f;
     dj::DeckFx fx;
+    dj::DeckEffects fxu;
 };
 
 class Engine : public oboe::AudioStreamDataCallback,
@@ -147,12 +155,18 @@ private:
         const int16_t* pcm = t->pcm.data();
         constexpr float k = 1.f / 32768.f;
 
+        const bool loopOn = d.loopOn.load() && !scr;
+        const double loopS = d.loopStart.load(), loopE = d.loopEnd.load();
+        const double loopLen = loopE - loopS;
         float* tmp = tmp_;
         double pos = d.pos;
         float rate = d.rate;
         for (int32_t i = 0; i < n; ++i) {
             rate += (target - rate) * a;
             pos += (double)rate * ratio;
+            if (loopOn && loopLen > 64.0 && rate > 0.f && pos >= loopE) {
+                pos = loopS + std::fmod(pos - loopS, loopLen);      // vuelta al inicio del loop
+            }
             if (pos <= 0.0) {
                 pos = 0.0;
                 if (rate < 0.f) rate = 0.f;
@@ -181,6 +195,14 @@ private:
 
         d.fx.process(tmp, n, (float)outRate_, d.eqLow.load(), d.eqMid.load(), d.eqHigh.load(),
                      d.filter.load());
+
+        {   // efecto del deck (despues del EQ/filtro); beatSec = duracion de un beat a la velocidad actual
+            const float bpm = d.bpm.load();
+            const float tempo = d.tempo.load();
+            const float beatSec = (bpm > 0.f && tempo > 0.1f) ? 60.f / (bpm * tempo) : 0.f;
+            d.fxu.process(tmp, n, (float)outRate_, d.fxType.load(), d.fxOn.load(), d.fxX.load(),
+                          d.fxY.load(), beatSec);
+        }
 
         const float vol = d.volume.load() * cfGain;
         float peak = 0.f;
@@ -290,6 +312,7 @@ JNI(jboolean, loadEnd)(JNIEnv*, jobject, jint deck) {
         }
     }
 
+    d.loopOn.store(false);
     d.playing.store(false);
     d.cuePreview.store(false);
     d.bpm.store(0.f);
@@ -401,6 +424,64 @@ JNI(jfloatArray, getDetail)(JNIEnv* env, jobject, jint deck) {
     jfloatArray arr = env->NewFloatArray(n);
     if (n > 0) env->SetFloatArrayRegion(arr, 0, n, t->detail.data());
     return arr;
+}
+
+// ---- loops ----
+// beats > 0: loop de esa cantidad de beats (1/16 = 0.0625 ... 32). Si ya hay un loop activo se conserva su
+// inicio; si no, empieza en el beat mas cercano a la posicion actual. Devuelve false si falta el BPM.
+JNI(jboolean, setLoop)(JNIEnv*, jobject, jint deck, jfloat beats) {
+    if (!validDeck(deck) || beats <= 0.f) return JNI_FALSE;
+    Deck& d = gEngine->decks[deck];
+    std::shared_ptr<Track> t = std::atomic_load(&d.track);
+    const float bpm = d.bpm.load();
+    if (!t || bpm <= 0.f) return JNI_FALSE;
+    const double per = 60.0 / bpm * t->sampleRate;
+    const double len = per * beats;
+    const double fb = d.firstBeat.load() * t->sampleRate;
+    double start;
+    if (d.loopOn.load()) {
+        start = d.loopStart.load();
+    } else {
+        const double step = std::min(per, len);                      // loops cortos se alinean a su propio largo
+        start = fb + std::round((d.position.load() - fb) / step) * step;
+    }
+    const double maxStart = (double)(t->frames - 2) - len;
+    if (maxStart <= 0.0) return JNI_FALSE;
+    start = std::clamp(start, 0.0, maxStart);
+    d.loopOn.store(false);
+    d.loopStart.store(start);
+    d.loopEnd.store(start + len);
+    d.loopOn.store(true);
+    return JNI_TRUE;
+}
+JNI(void, loopOff)(JNIEnv*, jobject, jint deck) {
+    if (validDeck(deck)) gEngine->decks[deck].loopOn.store(false);
+}
+// {inicio, fin} del loop en segundos; {0, 0} si no hay loop
+JNI(jdoubleArray, getLoop)(JNIEnv* env, jobject, jint deck) {
+    double r[2] = {0.0, 0.0};
+    if (validDeck(deck)) {
+        Deck& d = gEngine->decks[deck];
+        std::shared_ptr<Track> t = std::atomic_load(&d.track);
+        if (t && d.loopOn.load()) {
+            r[0] = d.loopStart.load() / t->sampleRate;
+            r[1] = d.loopEnd.load() / t->sampleRate;
+        }
+    }
+    jdoubleArray a = env->NewDoubleArray(2);
+    env->SetDoubleArrayRegion(a, 0, 2, r);
+    return a;
+}
+
+// ---- efectos ----
+// type: 1 eco, 2 reverb, 3 flanger, 4 phaser, 5 gate. on = pad tocado/bloqueado. x, y: 0..1
+JNI(void, setFx)(JNIEnv*, jobject, jint deck, jint type, jboolean on, jfloat x, jfloat y) {
+    if (!validDeck(deck)) return;
+    Deck& d = gEngine->decks[deck];
+    d.fxType.store(std::clamp((int)type, 0, 5));
+    d.fxX.store(std::clamp(x, 0.f, 1.f));
+    d.fxY.store(std::clamp(y, 0.f, 1.f));
+    d.fxOn.store(on == JNI_TRUE);
 }
 
 // ---- EQ / filtro (perillas -1..1, 0 = plano) ----

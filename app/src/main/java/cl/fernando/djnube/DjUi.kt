@@ -67,6 +67,15 @@ class DeckState(val index: Int) {
     var overview by mutableStateOf<FloatArray?>(null)
     var detail by mutableStateOf<FloatArray?>(null)   // 4 valores por bin de 5 ms: total, graves, medios, agudos
     var firstBeat by mutableDoubleStateOf(0.0)
+    var tab by mutableIntStateOf(0)             // 0 jog, 1 loops, 2 efectos
+    var loopBeats by mutableFloatStateOf(0f)    // 0 = sin loop
+    var loopStart by mutableDoubleStateOf(0.0)
+    var loopEnd by mutableDoubleStateOf(0.0)
+    var fxType by mutableIntStateOf(1)          // 1 eco, 2 reverb, 3 flanger, 4 phaser, 5 gate
+    var fxLock by mutableStateOf(false)
+    var fxTouch by mutableStateOf(false)
+    var fxX by mutableFloatStateOf(0.5f)
+    var fxY by mutableFloatStateOf(0.5f)
     var pendingSync by mutableStateOf(false)    // SYNC pedido mientras se calculaba el BPM
     var zoomSec by mutableFloatStateOf(6f)      // segundos visibles en el waveform ampliado
     var position by mutableDoubleStateOf(0.0)
@@ -90,6 +99,11 @@ class DeckState(val index: Int) {
         level = NativeEngine.getLevel(index)
         bpm = NativeEngine.getBpm(index)
         firstBeat = NativeEngine.getFirstBeat(index)
+        if (loopBeats > 0f) {
+            val lp = NativeEngine.getLoop(index)
+            loopStart = lp[0]; loopEnd = lp[1]
+            if (lp[1] <= lp[0]) loopBeats = 0f       // el motor lo desactivo (p.ej. al cargar otra pista)
+        }
     }
 
     fun pushEq() = NativeEngine.setEq(index, eqLow, eqMid, eqHigh)
@@ -203,6 +217,7 @@ fun DjApp() {
                     val gen = ++d.loadGen
                     d.analyzing = false
                     d.pendingSync = false
+                    d.loopBeats = 0f
                     d.detail = null
                     val t0 = SystemClock.elapsedRealtime()
                     try {
@@ -296,13 +311,26 @@ fun DeckPanel(d: DeckState, other: DeckState, accent: Color, modifier: Modifier,
         }
 
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-            val jog = minOf(maxHeight, maxWidth * 0.52f, 175.dp)
+            val jog = minOf(maxHeight - 26.dp, maxWidth * 0.52f, 175.dp)
             Row(
                 Modifier.fillMaxSize(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Jog(d, accent, Modifier.size(jog))
+                Column(Modifier.width(jog), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                        listOf("JOG", "LOOP", "FX").forEachIndexed { i, label ->
+                            SmallButton(label, accent, Modifier.weight(1f).height(22.dp), filled = d.tab == i) { d.tab = i }
+                        }
+                    }
+                    Box(Modifier.size(jog)) {
+                        when (d.tab) {
+                            1 -> LoopPad(d, say)
+                            2 -> FxPad(d, accent)
+                            else -> Jog(d, accent, Modifier.fillMaxSize())
+                        }
+                    }
+                }
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                         PadButton(
@@ -495,6 +523,15 @@ fun ZoomWave(d: DeckState, accent: Color, modifier: Modifier) {
                 drawLine(Color.White.copy(alpha = 0.9f), Offset(xx, mid - hh), Offset(xx, mid + hh), cw + 0.3f)
             }
         }
+        if (d.loopBeats > 0f && d.loopEnd > d.loopStart) {
+            val xs = ((d.loopStart - t0) / span * w).toFloat().coerceIn(0f, w)
+            val xe = ((d.loopEnd - t0) / span * w).toFloat().coerceIn(0f, w)
+            if (xe > xs) {
+                drawRect(YELLOW.copy(alpha = 0.20f), Offset(xs, 0f), Size(xe - xs, h))
+                drawLine(YELLOW, Offset(xs, 0f), Offset(xs, h), 3f)
+                drawLine(YELLOW, Offset(xe, 0f), Offset(xe, h), 3f)
+            }
+        }
         // cuadricula de beats (en tiempo de pista; la linea mas gruesa marca cada 4 beats)
         if (d.bpm > 0f && d.duration > 0) {
             val per = 60.0 / d.bpm
@@ -515,6 +552,107 @@ fun ZoomWave(d: DeckState, accent: Color, modifier: Modifier) {
         }
         drawLine(Color.White, Offset(w / 2f, 0f), Offset(w / 2f, h), 2.5f)
         drawLine(Color(0xFFE53935), Offset(w / 2f - 6f, 0f), Offset(w / 2f + 6f, 0f), 4f)
+    }
+}
+
+// ---------- loops ----------
+
+private val LOOP_SIZES = listOf(
+    0.0625f to "1/16", 0.125f to "1/8", 0.25f to "1/4", 0.5f to "1/2", 1f to "1",
+    2f to "2", 4f to "4", 8f to "8", 16f to "16", 32f to "32"
+)
+
+private fun toggleLoop(d: DeckState, beats: Float, say: (String) -> Unit) {
+    if (d.loopBeats == beats) {
+        NativeEngine.loopOff(d.index)
+        d.loopBeats = 0f
+        return
+    }
+    if (NativeEngine.setLoop(d.index, beats)) {
+        d.loopBeats = beats
+    } else {
+        say(if (d.analyzing) "Calculando BPM… prueba el loop en un momento" else "El loop necesita BPM: usa TAP si no se detecto")
+    }
+}
+
+/** Botones de loop de 1/16 a 32 beats; tocar el activo lo apaga. El loop arranca en el beat mas cercano. */
+@Composable
+fun LoopPad(d: DeckState, say: (String) -> Unit) {
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        for (r in 0 until 5) {
+            Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                for (c in 0 until 2) {
+                    val (beats, label) = LOOP_SIZES[r * 2 + c]
+                    SmallButton(label, YELLOW, Modifier.weight(1f).fillMaxHeight(), filled = d.loopBeats == beats) {
+                        toggleLoop(d, beats, say)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- efectos ----------
+
+private val FX_NAMES = listOf("", "ECO", "REVERB", "FLANGER", "PHASER", "GATE")
+
+private fun pushFx(d: DeckState) = NativeEngine.setFx(d.index, d.fxType, d.fxTouch || d.fxLock, d.fxX, d.fxY)
+
+/** Selector de efecto + pad XY: X = tiempo/velocidad, Y = cantidad. Tocar el pad lo activa; LOCK lo deja encendido. */
+@Composable
+fun FxPad(d: DeckState, accent: Color) {
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        for (row in 0 until 2) {
+            Row(Modifier.fillMaxWidth().height(22.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                for (c in 0 until 3) {
+                    val i = row * 3 + c + 1            // 1..6 ; el 6 es LOCK
+                    if (i <= 5) {
+                        SmallButton(FX_NAMES[i], PINK, Modifier.weight(1f).fillMaxHeight(), filled = d.fxType == i) {
+                            d.fxType = i
+                            pushFx(d)
+                        }
+                    } else {
+                        SmallButton("LOCK", YELLOW, Modifier.weight(1f).fillMaxHeight(), filled = d.fxLock) {
+                            d.fxLock = !d.fxLock
+                            pushFx(d)
+                        }
+                    }
+                }
+            }
+        }
+        Canvas(
+            Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(Color(0xFF0B1220))
+                .border(1.dp, if (d.fxTouch || d.fxLock) PINK else Color(0xFF223049), RoundedCornerShape(8.dp))
+                .pointerInput(d) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown()
+                        d.fxTouch = true
+                        fun upd(p: Offset) {
+                            d.fxX = (p.x / size.width).coerceIn(0f, 1f)
+                            d.fxY = (1f - p.y / size.height).coerceIn(0f, 1f)
+                            pushFx(d)
+                        }
+                        upd(down.position)
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            val p = ev.changes.firstOrNull() ?: break
+                            if (!p.pressed) break
+                            upd(p.position)
+                            p.consume()
+                        }
+                        d.fxTouch = false
+                        pushFx(d)
+                    }
+                }
+        ) {
+            val on = d.fxTouch || d.fxLock
+            val px = d.fxX * size.width
+            val py = (1f - d.fxY) * size.height
+            val col = if (on) PINK else MUTED
+            drawLine(col.copy(alpha = 0.35f), Offset(px, 0f), Offset(px, size.height), 1f)
+            drawLine(col.copy(alpha = 0.35f), Offset(0f, py), Offset(size.width, py), 1f)
+            drawCircle(col.copy(alpha = if (on) 0.9f else 0.5f), radius = if (on) 14f else 9f, center = Offset(px, py))
+        }
     }
 }
 

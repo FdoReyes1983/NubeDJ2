@@ -1,4 +1,4 @@
-# Nube DJ 2 (v0.2.2)
+# Nube DJ 2 (v0.3.0)
 
 App DJ Android con motor de audio propio en C++ (Oboe, baja latencia).
 
@@ -13,6 +13,7 @@ App DJ Android con motor de audio propio en C++ (Oboe, baja latencia).
 - **SYNC**: iguala el tempo al otro deck y, si ambos suenan, alinea también los beats.
 - v0.2.1: BPM mucho más preciso (ya no confunde 117 con 78 en reggaetón/dembow) y la pista suena al tiro: el BPM se calcula en segundo plano (muestra «…»).
 - v0.2.2: waveform ampliado (graves/medios/agudos, cuadricula de beats; arrastrar = mover, doble toque = zoom 3/6/12 s), SYNC pendiente si el BPM aun se calcula, boton RESET del pitch, tiempo de carga visible.
+- v0.3.0: pestañas JOG / LOOP / FX en cada deck. Loops de 1/16 a 32 beats (empiezan en el beat más cercano, se ven en el waveform). Efectos ECO, REVERB, FLANGER, PHASER y GATE con pad XY (X = tiempo/velocidad, Y = cantidad; LOCK lo deja encendido).
 - Rango de pitch seleccionable (±8 / ±16 / ±50 %).
 
 ## Compilar

@@ -36,6 +36,10 @@ object NativeEngine {
     external fun setFilter(deck: Int, v: Float)
 
     /** Analiza la pista cargada. Devuelve [bpm, primerBeatEnSegundos]; bpm = 0 si no lo detecta. */
+    external fun setLoop(deck: Int, beats: Float): Boolean
+    external fun loopOff(deck: Int)
+    external fun getLoop(deck: Int): DoubleArray
+    external fun setFx(deck: Int, type: Int, on: Boolean, x: Float, y: Float)
     external fun getDetail(deck: Int): FloatArray
     external fun analyzeBpm(deck: Int): FloatArray
     external fun setBpm(deck: Int, bpm: Float, firstBeat: Double)
