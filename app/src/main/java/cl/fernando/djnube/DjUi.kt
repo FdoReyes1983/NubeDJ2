@@ -483,7 +483,7 @@ fun DeckControls(d: DeckState, accent: Color, layout: Int = 0) {
                 Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Jog(d, accent, Modifier.size(minOf(maxHeight, maxWidth - 40.dp)))
+                Jog(d, accent, Modifier.size(minOf(maxHeight, maxWidth - 40.dp).coerceAtLeast(0.dp)))
                 pitch(Modifier.width(36.dp).fillMaxHeight())
             }
             1 -> Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -492,7 +492,7 @@ fun DeckControls(d: DeckState, accent: Color, layout: Int = 0) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     BoxWithConstraints(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
-                        Jog(d, accent, Modifier.size(minOf(maxWidth, maxHeight)))
+                        Jog(d, accent, Modifier.size(minOf(maxWidth, maxHeight).coerceAtLeast(0.dp)))
                     }
                     pitch(Modifier.width(40.dp).fillMaxHeight())
                 }
@@ -506,7 +506,7 @@ fun DeckControls(d: DeckState, accent: Color, layout: Int = 0) {
                 }
             }
             else -> {
-                val jog = minOf(maxHeight, maxWidth * 0.46f)
+                val jog = minOf(maxHeight, maxWidth * 0.46f).coerceAtLeast(0.dp)
                 val bh = ((maxHeight - 8.dp) / 3).coerceIn(24.dp, 38.dp)
                 Row(
                     Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(6.dp),
