@@ -478,12 +478,14 @@ fun DeckControls(d: DeckState, accent: Color, layout: Int = 0) {
         applyTempo(d)
     }
     BoxWithConstraints(Modifier.fillMaxSize()) {
+        val boxH = maxHeight
+        val boxW = maxWidth
         when (layout) {
             2 -> Row(
                 Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Jog(d, accent, Modifier.size(minOf(maxHeight, maxWidth - 40.dp).coerceAtLeast(0.dp)))
+                Jog(d, accent, Modifier.size(minOf(boxH, boxW - 40.dp).coerceAtLeast(0.dp)))
                 pitch(Modifier.width(36.dp).fillMaxHeight())
             }
             1 -> Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {

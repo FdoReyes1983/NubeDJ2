@@ -16,7 +16,8 @@ App DJ Android con motor de audio propio en C++ (Oboe, baja latencia).
 - v0.3.0: pestañas JOG / LOOP / FX en cada deck. Loops de 1/16 a 32 beats (empiezan en el beat más cercano, se ven en el waveform). Efectos ECO, REVERB, FLANGER, PHASER y GATE con pad XY (X = tiempo/velocidad, Y = cantidad; LOCK lo deja encendido).
 - v0.4.0: carga progresiva (la pista se puede tocar a los ~2.5 s, sigue cargando detrás), los dos waveforms ampliados juntos arriba y a la misma escala de tiempo real (se ve la sincronía), pestaña global DECK / LOOP / FX que cambia el panel de cada plato, mezclador compacto con faders de volumen verticales y fader de pitch vertical.
 - v0.5.0: la app gira con el teléfono. En vertical se elige el plato 1, el 2 o MIX (ambos), con pestañas DECK / LOOP / FX / EQ; en horizontal queda la vista de dos platos. Faders (volumen, pitch y crossfader) y perillas con aspecto de mesa de mezcla.
-- v0.5.1: correccion de compilacion + el workflow muestra el resumen de errores al fallar.
+- v0.5.2: corregido el error de compilacion (maxHeight/maxWidth dentro de Row).
+- v0.5.1: diagnostico de compilacion + el workflow muestra el resumen de errores al fallar.
 - Rango de pitch seleccionable (±8 / ±16 / ±50 %).
 
 ## Compilar
