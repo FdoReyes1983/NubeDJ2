@@ -1,0 +1,101 @@
+package cl.fernando.djnube
+
+import android.content.Context
+import androidx.compose.runtime.mutableStateListOf
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+
+/** Una pista de la biblioteca: se identifica por su URI; guarda el BPM/primer beat para no recalcularlos. */
+data class LibTrack(
+    val uri: String,
+    val name: String,
+    val bpm: Float = 0f,
+    val firstBeat: Double = 0.0,
+    val duration: Double = 0.0,
+    val lastPlayed: Long = 0L,   // 0 = nunca tocada (no aparece en el historial)
+    val plays: Int = 0
+)
+
+/** Biblioteca local persistente (library.json en el almacenamiento privado de la app). */
+object Library {
+    val tracks = mutableStateListOf<LibTrack>()
+    private var file: File? = null
+
+    fun init(ctx: Context) {
+        if (file != null) return
+        val f = File(ctx.applicationContext.filesDir, "library.json")
+        file = f
+        try {
+            if (f.exists()) {
+                val a = JSONArray(f.readText())
+                for (i in 0 until a.length()) {
+                    val o = a.getJSONObject(i)
+                    tracks.add(
+                        LibTrack(
+                            uri = o.getString("uri"),
+                            name = o.optString("name", "?"),
+                            bpm = o.optDouble("bpm", 0.0).toFloat(),
+                            firstBeat = o.optDouble("fb", 0.0),
+                            duration = o.optDouble("dur", 0.0),
+                            lastPlayed = o.optLong("last", 0L),
+                            plays = o.optInt("plays", 0)
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            // archivo danado: se empieza de cero
+        }
+    }
+
+    private fun save() {
+        val f = file ?: return
+        try {
+            val a = JSONArray()
+            for (t in tracks) {
+                a.put(
+                    JSONObject()
+                        .put("uri", t.uri).put("name", t.name).put("bpm", t.bpm.toDouble())
+                        .put("fb", t.firstBeat).put("dur", t.duration)
+                        .put("last", t.lastPlayed).put("plays", t.plays)
+                )
+            }
+            f.writeText(a.toString())
+        } catch (e: Exception) {
+            // sin espacio o sin permisos: la biblioteca sigue funcionando en memoria
+        }
+    }
+
+    fun find(uri: String): LibTrack? = tracks.firstOrNull { it.uri == uri }
+
+    private fun update(uri: String, name: String, f: (LibTrack) -> LibTrack) {
+        val i = tracks.indexOfFirst { it.uri == uri }
+        if (i < 0) tracks.add(f(LibTrack(uri, name))) else tracks[i] = f(tracks[i])
+        save()
+    }
+
+    /** Agrega pistas (uri a nombre) que aun no estan. Devuelve cuantas eran nuevas. */
+    fun addAll(items: List<Pair<String, String>>): Int {
+        var n = 0
+        for ((u, nm) in items) {
+            if (tracks.none { it.uri == u }) { tracks.add(LibTrack(u, nm)); n++ }
+        }
+        if (n > 0) save()
+        return n
+    }
+
+    /** Se cargo en un deck: entra al historial. */
+    fun played(uri: String, name: String, duration: Double) =
+        update(uri, name) { it.copy(duration = duration, lastPlayed = System.currentTimeMillis(), plays = it.plays + 1) }
+
+    fun saveBpm(uri: String, name: String, bpm: Float, firstBeat: Double, duration: Double) {
+        if (uri.isEmpty() || bpm <= 0f) return
+        update(uri, name) { it.copy(bpm = bpm, firstBeat = firstBeat, duration = if (duration > 0.0) duration else it.duration) }
+    }
+
+    fun remove(uri: String) {
+        tracks.removeAll { it.uri == uri }
+        save()
+    }
+}

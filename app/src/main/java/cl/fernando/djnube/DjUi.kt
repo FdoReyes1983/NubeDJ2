@@ -1,6 +1,10 @@
 package cl.fernando.djnube
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
@@ -13,6 +17,8 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -34,6 +40,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.documentfile.provider.DocumentFile
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
@@ -67,6 +74,7 @@ private val RANGES = listOf(8, 16, 50)  // rango del pitch en %
 
 class DeckState(val index: Int) {
     var name by mutableStateOf("Sin pista")
+    var uri = ""                                 // URI de la pista cargada (clave de la biblioteca)
     var loading by mutableStateOf(false)
     var analyzing by mutableStateOf(false)      // BPM calculandose en segundo plano
     var loadGen = 0                             // se incrementa en cada carga: descarta analisis viejos
@@ -152,12 +160,16 @@ private fun scaleBpm(d: DeckState, factor: Float) {
     val nb = b * factor
     if (nb < 40f || nb > 220f) return
     NativeEngine.setBpm(d.index, nb, NativeEngine.getFirstBeat(d.index))
+    Library.saveDeck(d)
 }
 
 /** SET: marca el punto actual como un beat (la cuadricula de beats se alinea a este punto). */
 private fun setAnchor(d: DeckState) {
     val b = NativeEngine.getBpm(d.index)
-    if (b > 0f) NativeEngine.setBpm(d.index, b, NativeEngine.getPositionSeconds(d.index))
+    if (b > 0f) {
+        NativeEngine.setBpm(d.index, b, NativeEngine.getPositionSeconds(d.index))
+        Library.saveDeck(d)
+    }
 }
 
 /** TAP: toca al ritmo de la musica (3 o mas veces) para fijar el BPM y alinear los beats. */
@@ -190,6 +202,55 @@ private fun registerTap(d: DeckState) {
         first = ph * period
     }
     NativeEngine.setBpm(d.index, trackBpm.toFloat(), first)
+    Library.saveDeck(d)
+}
+
+// ---------- biblioteca: ayudas ----------
+
+private val AUDIO_EXT = setOf("mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma")
+
+private fun Library.saveDeck(d: DeckState) {
+    val b = NativeEngine.getBpm(d.index)
+    saveBpm(d.uri, d.name, b, NativeEngine.getFirstBeat(d.index), NativeEngine.getDurationSeconds(d.index))
+}
+
+private fun persistRead(ctx: Context, uri: Uri) {
+    try {
+        ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    } catch (e: Exception) {
+        // el proveedor no permite permiso persistente: la pista sirve esta sesion
+    }
+}
+
+private fun displayName(ctx: Context, uri: Uri): String {
+    var n: String? = null
+    try {
+        ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) n = c.getString(0)
+        }
+    } catch (e: Exception) {
+        // sin nombre: se usa el final de la URI
+    }
+    return (n ?: uri.lastPathSegment ?: "Pista").substringBeforeLast('.')
+}
+
+/** Recorre una carpeta elegida (hasta 6 niveles) y devuelve las pistas de audio como (uri, nombre). */
+private fun scanTree(ctx: Context, tree: Uri): List<Pair<String, String>> {
+    val out = ArrayList<Pair<String, String>>()
+    fun walk(dir: DocumentFile, depth: Int) {
+        for (f in dir.listFiles()) {
+            if (f.isDirectory) {
+                if (depth < 6) walk(f, depth + 1)
+            } else {
+                val n = f.name ?: continue
+                val ext = n.substringAfterLast('.', "").lowercase()
+                if (f.type?.startsWith("audio/") == true || ext in AUDIO_EXT) out.add(f.uri.toString() to n.substringBeforeLast('.'))
+            }
+        }
+    }
+    val root = DocumentFile.fromTreeUri(ctx, tree) ?: return out
+    walk(root, 0)
+    return out
 }
 
 // ---------- pantalla ----------
@@ -199,6 +260,7 @@ fun DjApp() {
     MaterialTheme(colorScheme = darkColorScheme()) {
         val ctx = LocalContext.current
         val scope = rememberCoroutineScope()
+        remember { Library.init(ctx); true }
         val decks = remember { listOf(DeckState(0), DeckState(1)) }
         var crossfader by remember { mutableFloatStateOf(0.5f) }
         var message by remember { mutableStateOf<String?>(null) }
@@ -219,9 +281,10 @@ fun DjApp() {
 
         var mode by remember { mutableIntStateOf(0) }   // 0 DECK, 1 LOOP, 2 FX (pestana global)
 
-        val pickers = decks.map { d ->
-            rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-                if (uri != null) scope.launch {
+        val loadTrack: (DeckState, Uri) -> Unit = { d, uri ->
+                scope.launch {
+                    val uriStr = uri.toString()
+                    d.uri = uriStr
                     d.loading = true
                     val gen = ++d.loadGen
                     d.analyzing = false
@@ -247,14 +310,30 @@ fun DjApp() {
                         d.name = title
                         d.overview = NativeEngine.getOverview(d.index)
                         d.detail = NativeEngine.getDetail(d.index)
-                        if (gen == d.loadGen) d.loading = false
+                        if (gen == d.loadGen) {
+                            d.loading = false
+                            Library.played(uriStr, title, NativeEngine.getDurationSeconds(d.index))
+                            val saved = Library.find(uriStr)
+                            // BPM ya guardado en la biblioteca: se usa al instante, sin analizar
+                            if (saved != null && saved.bpm > 0f) NativeEngine.setBpm(d.index, saved.bpm, saved.firstBeat)
+                        }
                         val t1 = SystemClock.elapsedRealtime()
                         say("Lista para tocar en ${"%.1f".format((tPlay - t0) / 1000f)} s · completa en ${"%.1f".format((t1 - t0) / 1000f)} s")
                         // BPM en segundo plano: el BPM aparece cuando termina
-                        d.analyzing = true
-                        val r = withContext(Dispatchers.Default) { NativeEngine.analyzeBpm(d.index) }
+                        val hadBpm = NativeEngine.getBpm(d.index) > 0f
+                        var r = FloatArray(2)
+                        if (!hadBpm) {
+                            d.analyzing = true
+                            r = withContext(Dispatchers.Default) { NativeEngine.analyzeBpm(d.index) }
+                        }
                         if (gen == d.loadGen) {
                             if (NativeEngine.getBpm(d.index) == 0f) NativeEngine.setBpm(d.index, r[0], r[1].toDouble())
+                            if (!hadBpm) {
+                                Library.saveBpm(
+                                    uriStr, title, NativeEngine.getBpm(d.index),
+                                    NativeEngine.getFirstBeat(d.index), NativeEngine.getDurationSeconds(d.index)
+                                )
+                            }
                             d.analyzing = false
                             // SYNC pedido mientras se calculaba: se aplica ahora (de cualquiera de los dos decks)
                             for (x in decks) if (x.pendingSync) doSync(x, decks[1 - x.index], say)
@@ -266,6 +345,43 @@ fun DjApp() {
                     }
                     if (gen == d.loadGen) { d.loading = false; d.analyzing = false }
                 }
+        }
+        val pickers = decks.map { d ->
+            rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                if (uri != null) {
+                    persistRead(ctx, uri)
+                    loadTrack(d, uri)
+                }
+            }
+        }
+        var libOpen by remember { mutableStateOf(false) }
+        val addFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            if (uris.isNotEmpty()) {
+                val items = uris.map { u -> persistRead(ctx, u); u.toString() to displayName(ctx, u) }
+                val n = Library.addAll(items)
+                say(if (n == 0) "Esas pistas ya estaban en la biblioteca" else "$n pistas agregadas")
+            }
+        }
+        val addFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
+            if (tree != null) scope.launch {
+                persistRead(ctx, tree)
+                say("Buscando musica en la carpeta…")
+                val found = try {
+                    withContext(Dispatchers.IO) { scanTree(ctx, tree) }
+                } catch (e: Exception) {
+                    say("No se pudo leer la carpeta: ${e.message}")
+                    emptyList()
+                }
+                val n = Library.addAll(found)
+                say("${found.size} pistas encontradas, $n nuevas")
+            }
+        }
+        val loadFromLib: (LibTrack, Int) -> Unit = { t, i ->
+            val d = decks[i]
+            if (d.loading) say("Espera a que termine de cargar el deck ${deckLetter(d)}")
+            else {
+                libOpen = false
+                loadTrack(d, Uri.parse(t.uri))
             }
         }
         val openPicker: (DeckState) -> Unit = { d ->
@@ -369,10 +485,17 @@ fun DjApp() {
         Box(Modifier.fillMaxSize().background(BG)) {
             BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(6.dp)) {
                 if (maxWidth > maxHeight) {
-                    LandscapeLayout(decks, mode, { mode = it }, crossfader, onCrossUser, resetVol, openPicker, cycleZoom, say) { mixOpen = true }
+                    LandscapeLayout(decks, mode, { mode = it }, crossfader, onCrossUser, resetVol, openPicker, cycleZoom, say, { mixOpen = true }, { libOpen = true })
                 } else {
-                    PortraitLayout(decks, crossfader, onCrossUser, resetVol, openPicker, cycleZoom, say) { mixOpen = true }
+                    PortraitLayout(decks, crossfader, onCrossUser, resetVol, openPicker, cycleZoom, say, { mixOpen = true }, { libOpen = true })
                 }
+            }
+            if (libOpen) {
+                LibraryScreen(
+                    onClose = { libOpen = false }, onLoad = loadFromLib,
+                    onAddFiles = { addFiles.launch(arrayOf("audio/*")) },
+                    onAddFolder = { addFolder.launch(null) }
+                )
             }
             if (mixOpen) {
                 MixMenu(
@@ -401,7 +524,7 @@ fun DjApp() {
 fun LandscapeLayout(
     decks: List<DeckState>, mode: Int, onMode: (Int) -> Unit,
     crossfader: Float, onCrossfader: (Float) -> Unit, onResetVol: () -> Unit,
-    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit, onMix: () -> Unit
+    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit, onMix: () -> Unit, onLib: () -> Unit
 ) {
     val mixerW = 250.dp
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -412,6 +535,7 @@ fun LandscapeLayout(
                 listOf("DECK", "LOOP", "FX").forEachIndexed { i, label ->
                     SmallButton(label, Color.White, Modifier.weight(1f).fillMaxHeight(), filled = mode == i) { onMode(i) }
                 }
+                SmallButton("LIB", GREEN, Modifier.weight(1f).fillMaxHeight()) { onLib() }
             }
             DeckHeader(decks[1], PINK, Modifier.weight(1f)) { openPicker(decks[1]) }
         }
@@ -441,7 +565,7 @@ fun LandscapeLayout(
 @Composable
 fun PortraitLayout(
     decks: List<DeckState>, crossfader: Float, onCrossfader: (Float) -> Unit, onResetVol: () -> Unit,
-    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit, onMix: () -> Unit
+    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit, onMix: () -> Unit, onLib: () -> Unit
 ) {
     var sel by remember { mutableIntStateOf(2) }     // 0 = plato 1, 1 = plato 2, 2 = MIX
     var tab by remember { mutableIntStateOf(0) }     // 0 DECK, 1 LOOP, 2 FX, 3 EQ
@@ -476,6 +600,7 @@ fun PortraitLayout(
             listOf("DECK", "LOOP", "FX", "EQ").forEachIndexed { i, label ->
                 SmallButton(label, Color.White, Modifier.weight(1f).fillMaxHeight(), filled = tab == i) { tab = i }
             }
+            SmallButton("LIB", GREEN, Modifier.weight(1f).fillMaxHeight()) { onLib() }
         }
         // selector de plato: 1 | MIX | 2
         Row(Modifier.fillMaxWidth().height(36.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1366,6 +1491,91 @@ fun MixMenu(
                     textAlign = TextAlign.Center, modifier = Modifier.weight(1f)
                 )
                 SmallButton(">", Color.White, Modifier.width(52.dp).fillMaxHeight()) { onBars(1) }
+            }
+        }
+    }
+}
+
+// ---------- biblioteca ----------
+
+/** Boton para listas con scroll: actua al soltar (el SmallButton actua al tocar y dispararia al deslizar). */
+@Composable
+private fun ListButton(text: String, color: Color, filled: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(7.dp)
+    Box(
+        modifier.clip(shape).background(if (filled) color else BTN).border(1.dp, color, shape).clickable { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(text, color = if (filled) Color.Black else Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp, maxLines = 1)
+    }
+}
+
+/** Biblioteca local: CANCIONES (orden A-Z o por BPM) e HISTORIAL; cada fila carga la pista en el deck A o B. */
+@Composable
+fun LibraryScreen(onClose: () -> Unit, onLoad: (LibTrack, Int) -> Unit, onAddFiles: () -> Unit, onAddFolder: () -> Unit) {
+    var tab by remember { mutableIntStateOf(0) }       // 0 canciones, 1 historial
+    var sort by remember { mutableIntStateOf(0) }      // 0 A-Z, 1 BPM
+    val all = Library.tracks.toList()
+    val list = if (tab == 1) {
+        all.filter { it.lastPlayed > 0L }.sortedByDescending { it.lastPlayed }
+    } else if (sort == 1) {
+        all.sortedWith(compareBy<LibTrack> { if (it.bpm <= 0f) 1 else 0 }.thenBy { it.bpm }.thenBy { it.name.lowercase() })
+    } else {
+        all.sortedBy { it.name.lowercase() }
+    }
+    val dateFmt = remember { java.text.SimpleDateFormat("dd/MM HH:mm", java.util.Locale.getDefault()) }
+    Box(
+        Modifier.fillMaxSize().background(BG).windowInsetsPadding(WindowInsets.safeDrawing).padding(8.dp)
+            .pointerInput(Unit) { detectTapGestures { } }
+    ) {
+        Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth().height(40.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("BIBLIOTECA · ${all.size}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                SmallButton("+ ARCHIVOS", GREEN, Modifier.width(98.dp).fillMaxHeight()) { onAddFiles() }
+                SmallButton("+ CARPETA", GREEN, Modifier.width(92.dp).fillMaxHeight()) { onAddFolder() }
+                SmallButton("X", Color.White, Modifier.width(40.dp).fillMaxHeight()) { onClose() }
+            }
+            Row(Modifier.fillMaxWidth().height(36.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                SmallButton("CANCIONES", Color.White, Modifier.weight(1f).fillMaxHeight(), filled = tab == 0) { tab = 0 }
+                SmallButton("HISTORIAL", Color.White, Modifier.weight(1f).fillMaxHeight(), filled = tab == 1) { tab = 1 }
+                if (tab == 0) {
+                    SmallButton("A-Z", YELLOW, Modifier.width(56.dp).fillMaxHeight(), filled = sort == 0) { sort = 0 }
+                    SmallButton("BPM", YELLOW, Modifier.width(56.dp).fillMaxHeight(), filled = sort == 1) { sort = 1 }
+                }
+            }
+            if (list.isEmpty()) {
+                Text(
+                    if (tab == 1) "Aun no has tocado ninguna pista."
+                    else "Biblioteca vacia. Usa + ARCHIVOS o + CARPETA para agregar tu musica. El BPM se guarda solo la primera vez que cargas cada pista.",
+                    color = MUTED, fontSize = 13.sp, modifier = Modifier.padding(12.dp)
+                )
+            }
+            LazyColumn(Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                items(list, key = { it.uri }) { t ->
+                    Row(
+                        Modifier.fillMaxWidth().height(54.dp).clip(RoundedCornerShape(8.dp)).background(PANEL).padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(t.name, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            val sub = if (tab == 1) {
+                                dateFmt.format(java.util.Date(t.lastPlayed)) + (if (t.plays > 1) " · ${t.plays} veces" else "")
+                            } else {
+                                (if (t.duration > 0.0) fmt(t.duration) else "--:--") + (if (t.plays > 0) " · ${t.plays} veces" else "")
+                            }
+                            Text(sub, color = MUTED, fontSize = 11.sp, maxLines = 1)
+                        }
+                        Text(
+                            if (t.bpm > 0f) "%.1f".format(t.bpm) else "--",
+                            color = if (t.bpm > 0f) YELLOW else MUTED, fontSize = 15.sp, fontWeight = FontWeight.Bold
+                        )
+                        ListButton("A", CYAN, true, Modifier.width(40.dp).fillMaxHeight().padding(vertical = 7.dp)) { onLoad(t, 0) }
+                        ListButton("B", PINK, true, Modifier.width(40.dp).fillMaxHeight().padding(vertical = 7.dp)) { onLoad(t, 1) }
+                        if (tab == 0) {
+                            ListButton("X", MUTED, false, Modifier.width(32.dp).fillMaxHeight().padding(vertical = 10.dp)) { Library.remove(t.uri) }
+                        }
+                    }
+                }
             }
         }
     }
