@@ -13,6 +13,8 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -29,11 +31,13 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -278,13 +282,107 @@ fun DjApp() {
         }
         val onCross: (Float) -> Unit = { crossfader = it; NativeEngine.setCrossfader(it) }
 
+        // ---- Crossfader FX: mezcla automatica de un deck al otro ----
+        var mixOpen by remember { mutableStateOf(false) }
+        var mixFxOn by remember { mutableStateOf(true) }
+        var mixStyle by remember { mutableIntStateOf(1) }       // 0 fundido, 1 filter, 2 EQ
+        var mixBarsIdx by remember { mutableIntStateOf(1) }
+        var tempoMix by remember { mutableStateOf(true) }
+        var mixRunning by remember { mutableStateOf(false) }
+        var mixJob by remember { mutableStateOf<Job?>(null) }
+
+        val startMix: () -> Unit = startMix@{
+            if (mixRunning) { mixJob?.cancel(); mixOpen = false; return@startMix }
+            val cf = crossfader
+            val toB = if (cf < 0.45f) true else if (cf > 0.55f) false else (decks[0].playing || !decks[1].playing)
+            val out = decks[if (toB) 0 else 1]
+            val inn = decks[if (toB) 1 else 0]
+            if (inn.duration <= 0.0 || inn.loading) {
+                say("Carga una pista en el deck ${deckLetter(inn)} para mezclar")
+                return@startMix
+            }
+            mixOpen = false
+            val style = if (mixFxOn) mixStyle else 0
+            val bars = MIX_BARS[mixBarsIdx]
+            val useTempo = tempoMix
+            mixJob = scope.launch {
+                mixRunning = true
+                val oF = out.filter; val oL = out.eqLow
+                val iF = inn.filter; val iL = inn.eqLow
+                try {
+                    val bpmOut = out.bpm * (1f + out.tempoPct / 100f)
+                    val secs = (if (bpmOut > 0f) bars * 4 * 60f / bpmOut else bars * 2f).coerceIn(2f, 90f)
+                    var ramp = false
+                    if (useTempo && out.bpm > 0f && inn.bpm > 0f && !out.analyzing && !inn.analyzing) {
+                        val r = NativeEngine.syncDeck(inn.index)
+                        if (r >= 0f) {
+                            val pct = (r - 1f) * 100f
+                            inn.range = RANGES.firstOrNull { it >= abs(pct) } ?: 50
+                            inn.tempoPct = pct
+                            ramp = true
+                        }
+                    }
+                    val startPct = inn.tempoPct
+                    val from = crossfader
+                    val target = if (toB) 1f else 0f
+                    val applyFx: (Float) -> Unit = { q ->
+                        when (style) {
+                            1 -> {
+                                out.filter = oF + (0.85f - oF) * q
+                                inn.filter = -0.85f + (iF + 0.85f) * q
+                                NativeEngine.setFilter(out.index, out.filter)
+                                NativeEngine.setFilter(inn.index, inn.filter)
+                            }
+                            2 -> {
+                                out.eqLow = oL + (-1f - oL) * sm(q, 0.4f, 0.6f)
+                                inn.eqLow = -1f + (iL + 1f) * sm(q, 0.4f, 0.6f)
+                                out.pushEq(); inn.pushEq()
+                            }
+                            else -> {}
+                        }
+                    }
+                    applyFx(0f)
+                    onCross(from)
+                    if (!inn.playing) NativeEngine.setPlaying(inn.index, true)
+                    val t0 = SystemClock.elapsedRealtime()
+                    while (true) {
+                        val q = ((SystemClock.elapsedRealtime() - t0) / 1000f / secs).coerceIn(0f, 1f)
+                        onCross(from + (target - from) * q)
+                        applyFx(q)
+                        if (ramp) { inn.tempoPct = startPct * (1f - q); applyTempo(inn) }
+                        if (q >= 1f) break
+                        delay(16)
+                    }
+                    NativeEngine.setPlaying(out.index, false)
+                    say("Mezcla terminada: suena el deck ${deckLetter(inn)}")
+                } finally {
+                    out.filter = oF; inn.filter = iF
+                    NativeEngine.setFilter(out.index, oF); NativeEngine.setFilter(inn.index, iF)
+                    out.eqLow = oL; inn.eqLow = iL
+                    out.pushEq(); inn.pushEq()
+                    mixRunning = false
+                }
+            }
+        }
+        val onCrossUser: (Float) -> Unit = { mixJob?.cancel(); onCross(it) }
+
         Box(Modifier.fillMaxSize().background(BG)) {
             BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(6.dp)) {
                 if (maxWidth > maxHeight) {
-                    LandscapeLayout(decks, mode, { mode = it }, crossfader, onCross, resetVol, openPicker, cycleZoom, say)
+                    LandscapeLayout(decks, mode, { mode = it }, crossfader, onCrossUser, resetVol, openPicker, cycleZoom, say) { mixOpen = true }
                 } else {
-                    PortraitLayout(decks, crossfader, onCross, resetVol, openPicker, cycleZoom, say)
+                    PortraitLayout(decks, crossfader, onCrossUser, resetVol, openPicker, cycleZoom, say) { mixOpen = true }
                 }
+            }
+            if (mixOpen) {
+                MixMenu(
+                    fxOn = mixFxOn, onFxOn = { mixFxOn = it },
+                    style = mixStyle, onStyle = { mixStyle = it },
+                    tempoMix = tempoMix, onTempoMix = { tempoMix = it },
+                    bars = MIX_BARS[mixBarsIdx],
+                    onBars = { dl -> mixBarsIdx = (mixBarsIdx + dl).coerceIn(0, MIX_BARS.size - 1) },
+                    running = mixRunning, onGo = startMix, onClose = { mixOpen = false }
+                )
             }
             message?.let {
                 Text(
@@ -303,7 +401,7 @@ fun DjApp() {
 fun LandscapeLayout(
     decks: List<DeckState>, mode: Int, onMode: (Int) -> Unit,
     crossfader: Float, onCrossfader: (Float) -> Unit, onResetVol: () -> Unit,
-    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit
+    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit, onMix: () -> Unit
 ) {
     val mixerW = 250.dp
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -330,7 +428,7 @@ fun LandscapeLayout(
         }
         Row(Modifier.fillMaxWidth().weight(1.7f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             DeckArea(decks[0], decks[1], CYAN, mode, Modifier.weight(1f), say)
-            Mixer(decks, crossfader, onCrossfader, onResetVol, Modifier.width(mixerW))
+            Mixer(decks, crossfader, onCrossfader, onResetVol, Modifier.width(mixerW), onMixMenu = onMix)
             DeckArea(decks[1], decks[0], PINK, mode, Modifier.weight(1f), say)
         }
     }
@@ -343,7 +441,7 @@ fun LandscapeLayout(
 @Composable
 fun PortraitLayout(
     decks: List<DeckState>, crossfader: Float, onCrossfader: (Float) -> Unit, onResetVol: () -> Unit,
-    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit
+    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit, onMix: () -> Unit
 ) {
     var sel by remember { mutableIntStateOf(2) }     // 0 = plato 1, 1 = plato 2, 2 = MIX
     var tab by remember { mutableIntStateOf(0) }     // 0 DECK, 1 LOOP, 2 FX, 3 EQ
@@ -392,6 +490,7 @@ fun PortraitLayout(
             SmallButton("VOL↺", YELLOW, Modifier.width(52.dp).fillMaxHeight()) { onResetVol() }
             HFader(crossfader, onChange = onCrossfader, onReset = { onCrossfader(0.5f) }, modifier = Modifier.weight(1f).fillMaxHeight())
             SmallButton("C", Color.White, Modifier.width(34.dp).fillMaxHeight()) { onCrossfader(0.5f) }
+            SmallButton("AUTO", GREEN, Modifier.width(48.dp).fillMaxHeight()) { onMix() }
         }
     }
 }
@@ -1066,7 +1165,8 @@ fun Jog(d: DeckState, accent: Color, modifier: Modifier) {
 @Composable
 fun Mixer(
     decks: List<DeckState>, crossfader: Float,
-    onCrossfader: (Float) -> Unit, onResetVol: () -> Unit, modifier: Modifier, showCrossfader: Boolean = true
+    onCrossfader: (Float) -> Unit, onResetVol: () -> Unit, modifier: Modifier, showCrossfader: Boolean = true,
+    onMixMenu: () -> Unit = {}
 ) {
     Column(
         modifier.fillMaxHeight().clip(RoundedCornerShape(10.dp)).background(PANEL).padding(6.dp),
@@ -1101,6 +1201,7 @@ fun Mixer(
                 SmallButton("VOL↺", YELLOW, Modifier.width(48.dp).fillMaxHeight()) { onResetVol() }
                 HFader(crossfader, onChange = onCrossfader, onReset = { onCrossfader(0.5f) }, modifier = Modifier.weight(1f).fillMaxHeight())
                 SmallButton("C", Color.White, Modifier.width(28.dp).fillMaxHeight()) { onCrossfader(0.5f) }
+                SmallButton("AUTO", GREEN, Modifier.width(44.dp).fillMaxHeight()) { onMixMenu() }
             }
         }
     }
@@ -1208,4 +1309,64 @@ fun Vu(level: Float, modifier: Modifier) {
 private fun fmt(sec: Double): String {
     val s = sec.toInt().coerceAtLeast(0)
     return "%02d:%02d".format(s / 60, s % 60)
+}
+
+// ---------- Crossfader FX ----------
+
+private val MIX_BARS = listOf(1, 2, 4, 8, 16, 32)
+private val MIX_STYLES = listOf("FUNDIDO", "FILTER", "EQ")
+private val MIX_HINTS = listOf(
+    "Fundido cruzado simple entre los dos decks.",
+    "El deck que sale se apaga con un filtro pasa-altos y el que entra se abre desde un filtro pasa-bajos.",
+    "Intercambio de graves: el que sale pierde los bajos y el que entra los recupera a mitad de la mezcla."
+)
+
+private fun sm(p: Float, a: Float, b: Float): Float = ((p - a) / (b - a)).coerceIn(0f, 1f)
+
+/** Ventana de mezcla automatica: estilo, mezcla de tempo, largo en barras y MEZCLAR AHORA. */
+@Composable
+fun MixMenu(
+    fxOn: Boolean, onFxOn: (Boolean) -> Unit, style: Int, onStyle: (Int) -> Unit,
+    tempoMix: Boolean, onTempoMix: (Boolean) -> Unit, bars: Int, onBars: (Int) -> Unit,
+    running: Boolean, onGo: () -> Unit, onClose: () -> Unit
+) {
+    Box(
+        Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.6f))
+            .pointerInput(Unit) { detectTapGestures { onClose() } }
+    ) {
+        Column(
+            Modifier.align(Alignment.Center).fillMaxWidth(0.92f).widthIn(max = 360.dp)
+                .clip(RoundedCornerShape(14.dp)).background(Color(0xFF1C2230))
+                .pointerInput(Unit) { detectTapGestures { } }
+                .verticalScroll(rememberScrollState()).padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Crossfader FX", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Switch(checked = fxOn, onCheckedChange = onFxOn)
+            }
+            Row(Modifier.fillMaxWidth().height(40.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                MIX_STYLES.forEachIndexed { i, n ->
+                    SmallButton(n, if (fxOn) CYAN else MUTED, Modifier.weight(1f).fillMaxHeight(), filled = fxOn && style == i) { onStyle(i) }
+                }
+            }
+            Text(if (fxOn) MIX_HINTS[style.coerceIn(0, 2)] else MIX_HINTS[0], color = MUTED, fontSize = 11.sp)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Mezcla de tempo", color = Color.White, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                Switch(checked = tempoMix, onCheckedChange = onTempoMix)
+            }
+            SmallButton(
+                if (running) "CANCELAR MEZCLA" else "MEZCLAR AHORA", if (running) RED else GREEN,
+                Modifier.fillMaxWidth().height(42.dp), filled = true
+            ) { onGo() }
+            Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                SmallButton("<", Color.White, Modifier.width(52.dp).fillMaxHeight()) { onBars(-1) }
+                Text(
+                    if (bars == 1) "1 barra" else "$bars barras", color = Color.White, fontSize = 14.sp,
+                    textAlign = TextAlign.Center, modifier = Modifier.weight(1f)
+                )
+                SmallButton(">", Color.White, Modifier.width(52.dp).fillMaxHeight()) { onBars(1) }
+            }
+        }
+    }
 }
