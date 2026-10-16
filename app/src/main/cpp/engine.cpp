@@ -27,7 +27,12 @@ constexpr int kChunk = 1024;  // frames por bloque de DSP
 struct Track {
     std::vector<int16_t> pcm;  // estereo intercalado
     int sampleRate = 44100;
-    int64_t frames = 0;
+    // La pista se puede tocar mientras aun se decodifica: pcm se reserva completo al inicio (nunca se
+    // reasigna) y avail indica cuantos frames ya estan listos. frames = largo total (estimado hasta done).
+    std::atomic<int64_t> frames{0};
+    std::atomic<int64_t> avail{0};
+    std::atomic<bool> done{false};
+    int64_t capFrames = 0;
     std::vector<float> overview;
     std::vector<float> detail;   // 4 valores por bin de 5 ms: total, graves, medios, agudos (0..1)
 };
@@ -46,6 +51,8 @@ struct Deck {
     std::atomic<bool> seekPending{false};
     std::atomic<double> seekTarget{0.0};
     std::atomic<float> level{0.f};
+    std::atomic<float> loadFrac{1.f};     // progreso de la carga actual (0..1)
+    bool published = false;               // solo hilo de carga
     // EQ / filtro (perillas -1..1) y BPM de la pista cargada (0 = desconocido)
     std::atomic<float> eqLow{0.f}, eqMid{0.f}, eqHigh{0.f}, filter{0.f};
     std::atomic<float> bpm{0.f};
@@ -137,13 +144,14 @@ private:
 
     void renderDeck(Deck& d, float* out, int32_t n, float cfGain) {
         std::shared_ptr<Track> t = std::atomic_load(&d.track);
-        if (!t || t->frames < 2) {
+        const int64_t avail = t ? t->avail.load(std::memory_order_acquire) : 0;
+        if (!t || avail < 2) {
             d.level.store(d.level.load() * 0.85f);
             return;
         }
         const bool scr = d.scratching.load();
         if (d.seekPending.exchange(false)) {
-            d.pos = std::clamp(d.seekTarget.load(), 0.0, (double)(t->frames - 1));
+            d.pos = std::clamp(d.seekTarget.load(), 0.0, (double)(avail - 1));
             if (!d.playing.load() && !scr) d.rate = 0.f;
         }
         const double ratio = (double)t->sampleRate / (double)outRate_;
@@ -151,7 +159,8 @@ private:
         if (scr) target = d.scratchVel.load();
         else if (d.playing.load()) target = d.tempo.load();
         const float a = scr ? 0.007f : 0.0015f;  // suavizado de velocidad
-        const double last = (double)(t->frames - 1);
+        const bool trackDone = t->done.load(std::memory_order_acquire);
+        const double last = (double)(avail - 1);
         const int16_t* pcm = t->pcm.data();
         constexpr float k = 1.f / 32768.f;
 
@@ -174,14 +183,14 @@ private:
                 pos = last;
                 if (rate > 0.f) {
                     rate = 0.f;
-                    if (!scr) d.playing.store(false);
+                    if (!scr && trackDone) d.playing.store(false);   // si aun decodifica, espera los datos
                 }
             }
             const float g = std::min(1.f, std::fabs(rate) * 50.f);  // silencio si esta detenido
             float l = 0.f, r = 0.f;
             if (g > 0.f) {
                 const int64_t i0 = (int64_t)pos;
-                const int64_t i1 = std::min<int64_t>(i0 + 1, t->frames - 1);
+                const int64_t i1 = std::min<int64_t>(i0 + 1, avail - 1);
                 const float f = (float)(pos - (double)i0);
                 l = (pcm[i0 * 2] + (pcm[i1 * 2] - pcm[i0 * 2]) * f) * k * g;
                 r = (pcm[i0 * 2 + 1] + (pcm[i1 * 2 + 1] - pcm[i0 * 2 + 1]) * f) * k * g;
@@ -236,19 +245,55 @@ JNI(void, stop)(JNIEnv*, jobject) { gEngine->stop(); }
 JNI(void, loadBegin)(JNIEnv*, jobject, jint deck, jint sampleRate, jint estFrames) {
     if (!validDeck(deck)) return;
     Deck& d = gEngine->decks[deck];
-    d.loading = std::make_shared<Track>();
-    d.loading->sampleRate = sampleRate > 0 ? sampleRate : 44100;
-    if (estFrames > 0) d.loading->pcm.reserve((size_t)estFrames * 2 + 8192);
+    auto t = std::make_shared<Track>();
+    t->sampleRate = sampleRate > 0 ? sampleRate : 44100;
+    // capacidad fija (estimacion + 2 % + 5 s); sin duracion conocida se reservan 10 min
+    t->capFrames = estFrames > 0 ? (int64_t)((double)estFrames * 1.02) + (int64_t)t->sampleRate * 5
+                                 : (int64_t)t->sampleRate * 600;
+    t->pcm.assign((size_t)t->capFrames * 2, 0);
+    t->frames.store(estFrames > 0 ? estFrames : 0);
+    d.loadFrac.store(0.f);
+    d.published = false;
+    d.loading = t;
 }
 
 JNI(void, loadAppend)(JNIEnv* env, jobject, jint deck, jshortArray arr, jint frames) {
     if (!validDeck(deck)) return;
     Deck& d = gEngine->decks[deck];
-    if (!d.loading || frames <= 0) return;
-    jshort* p = env->GetShortArrayElements(arr, nullptr);
-    if (!p) return;
-    d.loading->pcm.insert(d.loading->pcm.end(), p, p + (size_t)frames * 2);
-    env->ReleaseShortArrayElements(arr, p, JNI_ABORT);
+    Track* t = d.loading.get();
+    if (!t || frames <= 0) return;
+    const int64_t have = t->avail.load(std::memory_order_relaxed);
+    const int64_t n = std::min<int64_t>(frames, t->capFrames - have);
+    if (n <= 0) return;                                             // mas largo de lo estimado: se recorta
+    env->GetShortArrayRegion(arr, 0, (jsize)(n * 2), t->pcm.data() + have * 2);   // directo, sin copia intermedia
+    t->avail.store(have + n, std::memory_order_release);
+    const int64_t tot = t->frames.load();
+    d.loadFrac.store(tot > 0 ? std::min(1.f, (float)((double)(have + n) / (double)tot)) : 0.f);
+}
+
+// Deja la pista en carga disponible para tocar (cuando ya hay unos segundos decodificados).
+static bool publishLoading(Deck& d) {
+    std::shared_ptr<Track> t = d.loading;
+    if (!t || d.published || t->avail.load() < 2) return false;
+    d.published = true;
+    d.loopOn.store(false);
+    d.playing.store(false);
+    d.cuePreview.store(false);
+    d.bpm.store(0.f);
+    d.firstBeat.store(0.0);
+    d.cue.store(0.0);
+    d.seekTarget.store(0.0);
+    d.seekPending.store(true);
+    std::atomic_store(&d.track, t);
+    return true;
+}
+
+JNI(jboolean, loadPublish)(JNIEnv*, jobject, jint deck) {
+    return validDeck(deck) && publishLoading(gEngine->decks[deck]) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNI(jfloat, getLoadFraction)(JNIEnv*, jobject, jint deck) {
+    return validDeck(deck) ? gEngine->decks[deck].loadFrac.load() : 1.f;
 }
 
 JNI(jboolean, loadEnd)(JNIEnv*, jobject, jint deck) {
@@ -257,9 +302,10 @@ JNI(jboolean, loadEnd)(JNIEnv*, jobject, jint deck) {
     std::shared_ptr<Track> t = d.loading;
     d.loading.reset();
     if (!t) return JNI_FALSE;
-    t->frames = (int64_t)(t->pcm.size() / 2);
-    if (t->frames < 2) return JNI_FALSE;
-    t->pcm.shrink_to_fit();
+    const int64_t total = t->avail.load();
+    if (total < 2) return JNI_FALSE;
+    t->frames.store(total);
+    t->pcm.resize((size_t)total * 2);        // solo recorta (no reasigna): el hilo de audio sigue leyendo sin problema
 
     t->overview.assign(kBins, 0.f);
     float gmax = 0.f;
@@ -312,15 +358,11 @@ JNI(jboolean, loadEnd)(JNIEnv*, jobject, jint deck) {
         }
     }
 
-    d.loopOn.store(false);
-    d.playing.store(false);
-    d.cuePreview.store(false);
-    d.bpm.store(0.f);
-    d.firstBeat.store(0.0);
-    d.cue.store(0.0);
-    d.seekTarget.store(0.0);
-    d.seekPending.store(true);
-    std::atomic_store(&d.track, t);
+    d.loadFrac.store(1.f);
+    t->done.store(true, std::memory_order_release);
+    d.loading = t;                            // por si aun no se publico
+    publishLoading(d);
+    d.loading.reset();
     return JNI_TRUE;
 }
 
@@ -331,7 +373,7 @@ JNI(void, setPlaying)(JNIEnv*, jobject, jint deck, jboolean playing) {
     auto t = std::atomic_load(&d.track);
     if (!t) return;
     d.cuePreview.store(false);
-    if (playing && d.position.load() >= (double)(t->frames - 2)) gEngine->seekFrames(deck, 0.0);
+    if (playing && d.position.load() >= (double)(t->avail.load() - 2)) gEngine->seekFrames(deck, 0.0);
     d.playing.store(playing == JNI_TRUE);
 }
 
@@ -403,7 +445,7 @@ JNI(jdouble, getPositionSeconds)(JNIEnv*, jobject, jint deck) {
 JNI(jdouble, getDurationSeconds)(JNIEnv*, jobject, jint deck) {
     if (!validDeck(deck)) return 0.0;
     auto t = std::atomic_load(&gEngine->decks[deck].track);
-    return t ? (double)t->frames / t->sampleRate : 0.0;
+    return t ? (double)std::max<int64_t>(t->frames.load(), t->avail.load()) / t->sampleRate : 0.0;
 }
 JNI(jfloat, getLevel)(JNIEnv*, jobject, jint deck) {
     return validDeck(deck) ? gEngine->decks[deck].level.load() : 0.f;
@@ -445,7 +487,7 @@ JNI(jboolean, setLoop)(JNIEnv*, jobject, jint deck, jfloat beats) {
         const double step = std::min(per, len);                      // loops cortos se alinean a su propio largo
         start = fb + std::round((d.position.load() - fb) / step) * step;
     }
-    const double maxStart = (double)(t->frames - 2) - len;
+    const double maxStart = (double)(t->avail.load() - 2) - len;
     if (maxStart <= 0.0) return JNI_FALSE;
     start = std::clamp(start, 0.0, maxStart);
     d.loopOn.store(false);
@@ -503,8 +545,8 @@ JNI(jfloatArray, analyzeBpm)(JNIEnv* env, jobject, jint deck) {
     float res[2] = {0.f, 0.f};
     if (validDeck(deck)) {
         std::shared_ptr<Track> t = std::atomic_load(&gEngine->decks[deck].track);
-        if (t) {
-            const dj::BpmResult r = dj::analyzeBpm(t->pcm.data(), t->frames, t->sampleRate);
+        if (t && t->done.load()) {
+            const dj::BpmResult r = dj::analyzeBpm(t->pcm.data(), t->frames.load(), t->sampleRate);
             res[0] = r.bpm;
             res[1] = (float)r.firstBeat;
         }

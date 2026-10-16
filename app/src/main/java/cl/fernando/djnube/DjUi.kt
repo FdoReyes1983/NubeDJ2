@@ -67,7 +67,7 @@ class DeckState(val index: Int) {
     var overview by mutableStateOf<FloatArray?>(null)
     var detail by mutableStateOf<FloatArray?>(null)   // 4 valores por bin de 5 ms: total, graves, medios, agudos
     var firstBeat by mutableDoubleStateOf(0.0)
-    var tab by mutableIntStateOf(0)             // 0 jog, 1 loops, 2 efectos
+    var loadFrac by mutableFloatStateOf(1f)     // progreso de la carga (0..1)
     var loopBeats by mutableFloatStateOf(0f)    // 0 = sin loop
     var loopStart by mutableDoubleStateOf(0.0)
     var loopEnd by mutableDoubleStateOf(0.0)
@@ -99,6 +99,7 @@ class DeckState(val index: Int) {
         level = NativeEngine.getLevel(index)
         bpm = NativeEngine.getBpm(index)
         firstBeat = NativeEngine.getFirstBeat(index)
+        if (loading) loadFrac = NativeEngine.getLoadFraction(index)
         if (loopBeats > 0f) {
             val lp = NativeEngine.getLoop(index)
             loopStart = lp[0]; loopEnd = lp[1]
@@ -210,6 +211,8 @@ fun DjApp() {
             }
         }
 
+        var mode by remember { mutableIntStateOf(0) }   // 0 DECK, 1 LOOP, 2 FX (pestana global)
+
         val pickers = decks.map { d ->
             rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                 if (uri != null) scope.launch {
@@ -219,18 +222,29 @@ fun DjApp() {
                     d.pendingSync = false
                     d.loopBeats = 0f
                     d.detail = null
+                    d.overview = null
+                    d.loadFrac = 0f
+                    d.name = "Abriendo…"
                     val t0 = SystemClock.elapsedRealtime()
+                    var tPlay = 0L
                     try {
-                        val title = withContext(Dispatchers.Default) { TrackLoader.load(ctx, uri, d.index) }
+                        // La pista se puede tocar en cuanto hay ~2.5 s decodificados (onPlayable): sigue cargando detras.
+                        val title = withContext(Dispatchers.Default) {
+                            TrackLoader.load(ctx, uri, d.index) { ttl ->
+                                tPlay = SystemClock.elapsedRealtime()
+                                d.name = ttl
+                                d.taps.clear()
+                                d.tempoPct = 0f
+                                NativeEngine.setTempo(d.index, 1f)
+                            }
+                        }
                         d.name = title
                         d.overview = NativeEngine.getOverview(d.index)
                         d.detail = NativeEngine.getDetail(d.index)
-                        say("Cargada en ${"%.1f".format((SystemClock.elapsedRealtime() - t0) / 1000f)} s")
-                        d.taps.clear()
-                        d.tempoPct = 0f
-                        NativeEngine.setTempo(d.index, 1f)
                         if (gen == d.loadGen) d.loading = false
-                        // BPM en segundo plano: la pista ya suena, el BPM aparece cuando termina
+                        val t1 = SystemClock.elapsedRealtime()
+                        say("Lista para tocar en ${"%.1f".format((tPlay - t0) / 1000f)} s · completa en ${"%.1f".format((t1 - t0) / 1000f)} s")
+                        // BPM en segundo plano: el BPM aparece cuando termina
                         d.analyzing = true
                         val r = withContext(Dispatchers.Default) { NativeEngine.analyzeBpm(d.index) }
                         if (gen == d.loadGen) {
@@ -248,23 +262,55 @@ fun DjApp() {
                 }
             }
         }
+        val openPicker: (DeckState) -> Unit = { d ->
+            if (d.loading) say("Espera a que termine de cargar el deck ${deckLetter(d)}")
+            else pickers[d.index].launch(arrayOf("audio/*"))
+        }
+        val cycleZoom: () -> Unit = {
+            val nz = when { decks[0].zoomSec <= 3.5f -> 6f; decks[0].zoomSec <= 7f -> 12f; else -> 3f }
+            decks.forEach { it.zoomSec = nz }
+        }
+        val mixerW = 250.dp
 
         Box(Modifier.fillMaxSize().background(BG)) {
-            Row(
+            Column(
                 Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(6.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                DeckPanel(decks[0], decks[1], CYAN, Modifier.weight(1f), say) { pickers[0].launch(arrayOf("audio/*")) }
-                Mixer(
-                    decks, crossfader,
-                    onCrossfader = { crossfader = it; NativeEngine.setCrossfader(it) },
-                    onResetVol = {
-                        decks.forEach { it.volume = 1f; NativeEngine.setVolume(it.index, 1f) }
-                        say("Volumen de ambos decks al maximo")
-                    },
-                    modifier = Modifier.width(250.dp)
-                )
-                DeckPanel(decks[1], decks[0], PINK, Modifier.weight(1f), say) { pickers[1].launch(arrayOf("audio/*")) }
+                // cabecera: titulo, BPM y tiempo de cada deck + pestanas de modo en el centro
+                Row(Modifier.fillMaxWidth().height(30.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    DeckHeader(decks[0], CYAN, Modifier.weight(1f)) { openPicker(decks[0]) }
+                    Row(Modifier.width(mixerW), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                        listOf("DECK", "LOOP", "FX").forEachIndexed { i, label ->
+                            SmallButton(label, Color.White, Modifier.weight(1f).fillMaxHeight(), filled = mode == i) { mode = i }
+                        }
+                    }
+                    DeckHeader(decks[1], PINK, Modifier.weight(1f)) { openPicker(decks[1]) }
+                }
+                // pista completa de cada deck (tocar = saltar)
+                Row(Modifier.fillMaxWidth().height(12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Waveform(decks[0], CYAN, Modifier.weight(1f).fillMaxHeight())
+                    Spacer(Modifier.width(mixerW))
+                    Waveform(decks[1], PINK, Modifier.weight(1f).fillMaxHeight())
+                }
+                // los dos waveforms ampliados, juntos y a la misma escala de tiempo real: se ve la sincronia
+                Column(Modifier.fillMaxWidth().weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    ZoomWave(decks[0], CYAN, Modifier.fillMaxWidth().weight(1f), cycleZoom)
+                    ZoomWave(decks[1], PINK, Modifier.fillMaxWidth().weight(1f), cycleZoom)
+                }
+                Row(Modifier.fillMaxWidth().weight(1.7f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    DeckArea(decks[0], decks[1], CYAN, mode, Modifier.weight(1f), say)
+                    Mixer(
+                        decks, crossfader,
+                        onCrossfader = { crossfader = it; NativeEngine.setCrossfader(it) },
+                        onResetVol = {
+                            decks.forEach { it.volume = 1f; NativeEngine.setVolume(it.index, 1f) }
+                            say("Volumen de ambos decks al maximo")
+                        },
+                        modifier = Modifier.width(mixerW)
+                    )
+                    DeckArea(decks[1], decks[0], PINK, mode, Modifier.weight(1f), say)
+                }
             }
             message?.let {
                 Text(
@@ -278,99 +324,129 @@ fun DjApp() {
     }
 }
 
+/** Cabecera de un deck: letra, titulo (con progreso mientras carga), BPM actual, tiempo restante y LOAD. */
 @Composable
-fun DeckPanel(d: DeckState, other: DeckState, accent: Color, modifier: Modifier, say: (String) -> Unit, onLoad: () -> Unit) {
+fun DeckHeader(d: DeckState, accent: Color, modifier: Modifier, onLoad: () -> Unit) {
+    Row(
+        modifier.clip(RoundedCornerShape(8.dp)).background(PANEL).padding(horizontal = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(deckLetter(d), color = accent, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        Text(
+            if (d.loading && d.name != "Abriendo…") "${d.name}  ·  cargando ${(d.loadFrac * 100).toInt()}%" else d.name,
+            color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            if (d.bpm > 0f) "%.1f".format(d.bpm * (1f + d.tempoPct / 100f)) else if (d.analyzing) "…" else "--",
+            color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold
+        )
+        Text("-" + fmt(d.duration - d.position), color = MUTED, fontSize = 11.sp)
+        SmallButton("LOAD", accent, Modifier.width(48.dp).fillMaxHeight().padding(vertical = 3.dp)) { onLoad() }
+    }
+}
+
+/** Panel inferior de un deck: segun la pestana global muestra jog, loops o efectos; CUE / PLAY / SYNC siempre abajo. */
+@Composable
+fun DeckArea(d: DeckState, other: DeckState, accent: Color, mode: Int, modifier: Modifier, say: (String) -> Unit) {
     Column(
-        modifier.fillMaxHeight().clip(RoundedCornerShape(10.dp)).background(PANEL).padding(8.dp),
+        modifier.fillMaxHeight().clip(RoundedCornerShape(10.dp)).background(PANEL).padding(6.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("DECK ${deckLetter(d)}", color = accent, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.width(8.dp))
-            Text(
-                if (d.loading) "Cargando…" else d.name, color = Color.White, fontSize = 14.sp,
-                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
-            )
-            OutlinedButton(
-                onClick = onLoad, contentPadding = PaddingValues(horizontal = 10.dp),
-                modifier = Modifier.height(32.dp)
-            ) { Text("LOAD", fontSize = 12.sp) }
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            when (mode) {
+                1 -> LoopPad(d, say)
+                2 -> FxPad(d, accent)
+                else -> DeckControls(d, accent)
+            }
         }
-        ZoomWave(d, accent, Modifier.fillMaxWidth().height(64.dp))
-        Waveform(d, accent, Modifier.fillMaxWidth().height(24.dp))
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "${fmt(d.position)} / ${fmt(d.duration)}", color = MUTED, fontSize = 12.sp,
-                modifier = Modifier.weight(1f)
+        Row(Modifier.fillMaxWidth().height(40.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            PadButton(
+                "CUE", YELLOW, Modifier.weight(1f).fillMaxHeight(),
+                onPress = { NativeEngine.cuePress(d.index) },
+                onRelease = { NativeEngine.cueRelease(d.index) }
             )
-            Text("BPM ", color = MUTED, fontSize = 11.sp)
-            Text(
-                if (d.bpm > 0f) "%.1f".format(d.bpm * (1f + d.tempoPct / 100f)) else if (d.analyzing) "…" else "--",
-                color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold
+            PadButton(
+                if (d.playing) "PAUSA" else "PLAY", GREEN, Modifier.weight(1f).fillMaxHeight(),
+                onPress = { NativeEngine.setPlaying(d.index, !NativeEngine.isPlaying(d.index)) }
             )
+            SmallButton("SYNC", accent, Modifier.weight(1f).fillMaxHeight(), filled = true) { doSync(d, other, say) }
         }
+    }
+}
 
-        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-            val jog = minOf(maxHeight - 26.dp, maxWidth * 0.52f, 175.dp)
-            Row(
-                Modifier.fillMaxSize(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(Modifier.width(jog), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                        listOf("JOG", "LOOP", "FX").forEachIndexed { i, label ->
-                            SmallButton(label, accent, Modifier.weight(1f).height(22.dp), filled = d.tab == i) { d.tab = i }
-                        }
-                    }
-                    Box(Modifier.size(jog)) {
-                        when (d.tab) {
-                            1 -> LoopPad(d, say)
-                            2 -> FxPad(d, accent)
-                            else -> Jog(d, accent, Modifier.fillMaxSize())
-                        }
-                    }
+/** Pestana DECK: jog (scratch), fader de pitch vertical y botones de BPM. */
+@Composable
+fun DeckControls(d: DeckState, accent: Color) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val jog = minOf(maxHeight, maxWidth * 0.46f)
+        val rg = d.range.toFloat()
+        val bh = ((maxHeight - 8.dp) / 3).coerceIn(24.dp, 38.dp)
+        Row(
+            Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Jog(d, accent, Modifier.size(jog))
+            Column(Modifier.width(34.dp).height(jog), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("%+.1f".format(d.tempoPct), color = MUTED, fontSize = 9.sp, maxLines = 1)
+                VFader(
+                    value = d.tempoPct.coerceIn(-rg, rg), min = -rg, max = rg, color = accent,
+                    onChange = { v -> d.tempoPct = if (abs(v) < 0.25f) 0f else v; applyTempo(d) },
+                    onReset = { d.tempoPct = 0f; applyTempo(d) },
+                    modifier = Modifier.weight(1f).fillMaxWidth()
+                )
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    SmallButton("÷2", accent, Modifier.weight(1f).height(bh)) { scaleBpm(d, 0.5f) }
+                    SmallButton("×2", accent, Modifier.weight(1f).height(bh)) { scaleBpm(d, 2f) }
                 }
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                        PadButton(
-                            "CUE", YELLOW, Modifier.weight(1f).height(44.dp),
-                            onPress = { NativeEngine.cuePress(d.index) },
-                            onRelease = { NativeEngine.cueRelease(d.index) }
-                        )
-                        PadButton(
-                            if (d.playing) "PAUSA" else "PLAY", GREEN, Modifier.weight(1f).height(44.dp),
-                            onPress = { NativeEngine.setPlaying(d.index, !NativeEngine.isPlaying(d.index)) }
-                        )
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    SmallButton("TAP", YELLOW, Modifier.weight(1f).height(bh)) { registerTap(d) }
+                    SmallButton("SET", YELLOW, Modifier.weight(1f).height(bh)) { setAnchor(d) }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    SmallButton("±${d.range}", MUTED, Modifier.weight(1f).height(bh)) {
+                        d.range = RANGES[(RANGES.indexOf(d.range) + 1) % RANGES.size]
+                        d.tempoPct = d.tempoPct.coerceIn(-d.range.toFloat(), d.range.toFloat())
+                        applyTempo(d)
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        SmallButton("SYNC", accent, Modifier.weight(1.5f).height(34.dp), filled = true) { doSync(d, other, say) }
-                        SmallButton("÷2", accent, Modifier.weight(1f).height(34.dp)) { scaleBpm(d, 0.5f) }
-                        SmallButton("×2", accent, Modifier.weight(1f).height(34.dp)) { scaleBpm(d, 2f) }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        SmallButton("TAP", YELLOW, Modifier.weight(1f).height(34.dp)) { registerTap(d) }
-                        SmallButton("SET", YELLOW, Modifier.weight(1f).height(34.dp)) { setAnchor(d) }
-                        SmallButton("±${d.range}", MUTED, Modifier.weight(1f).height(34.dp)) {
-                            d.range = RANGES[(RANGES.indexOf(d.range) + 1) % RANGES.size]
-                            d.tempoPct = d.tempoPct.coerceIn(-d.range.toFloat(), d.range.toFloat())
-                            applyTempo(d)
-                        }
-                    }
-                    val rg = d.range.toFloat()
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("PITCH ${"%+.1f".format(d.tempoPct)}%", color = MUTED, fontSize = 11.sp, modifier = Modifier.weight(1f))
-                        SmallButton("RESET", YELLOW, Modifier.width(64.dp).height(24.dp)) { d.tempoPct = 0f; applyTempo(d) }
-                    }
-                    Slider(
-                        value = d.tempoPct.coerceIn(-rg, rg), valueRange = -rg..rg,
-                        onValueChange = { d.tempoPct = it; applyTempo(d) },
-                        colors = SliderDefaults.colors(thumbColor = accent, activeTrackColor = accent),
-                        modifier = Modifier.height(28.dp)
-                    )
+                    SmallButton("RESET", YELLOW, Modifier.weight(1f).height(bh)) { d.tempoPct = 0f; applyTempo(d) }
                 }
             }
         }
+    }
+}
+
+/** Fader vertical (arriba = max). Arrastrar para mover, doble toque = onReset. */
+@Composable
+fun VFader(value: Float, min: Float, max: Float, color: Color, onChange: (Float) -> Unit, onReset: () -> Unit, modifier: Modifier) {
+    val change by rememberUpdatedState(onChange)
+    val reset by rememberUpdatedState(onReset)
+    Canvas(
+        modifier
+            .pointerInput(Unit) { detectTapGestures(onDoubleTap = { reset() }) }
+            .pointerInput(Unit) {
+                detectVerticalDragGestures { ch, _ ->
+                    ch.consume()
+                    val f = 1f - (ch.position.y / size.height).coerceIn(0f, 1f)
+                    change(min + f * (max - min))
+                }
+            }
+    ) {
+        val cx = size.width / 2f
+        val pad = 10f
+        val f = ((value - min) / (max - min)).coerceIn(0f, 1f)
+        val y = pad + (1f - f) * (size.height - 2 * pad)
+        drawLine(Color(0xFF223049), Offset(cx, pad), Offset(cx, size.height - pad), 6f, StrokeCap.Round)
+        drawLine(color.copy(alpha = 0.8f), Offset(cx, size.height - pad), Offset(cx, y), 6f, StrokeCap.Round)
+        if (min < 0f) {   // marca del centro (pitch en 0)
+            val yc = pad + 0.5f * (size.height - 2 * pad)
+            drawLine(Color.White.copy(alpha = 0.6f), Offset(cx - 9f, yc), Offset(cx + 9f, yc), 2f)
+        }
+        drawRoundRect(Color.White, Offset(cx - 13f, y - 8f), Size(26f, 16f), androidx.compose.ui.geometry.CornerRadius(5f, 5f))
+        drawRoundRect(color, Offset(cx - 13f, y - 2f), Size(26f, 4f), androidx.compose.ui.geometry.CornerRadius(2f, 2f))
     }
 }
 
@@ -439,6 +515,7 @@ fun Waveform(d: DeckState, accent: Color, modifier: Modifier) {
         val h = size.height
         val prog = if (d.duration > 0) (d.position / d.duration).toFloat() else 0f
         val ov = d.overview
+        if (ov == null && d.loading) drawRect(accent.copy(alpha = 0.35f), Offset(0f, 0f), Size(w * d.loadFrac, h))
         if (ov != null && ov.isNotEmpty()) {
             val n = w.toInt()
             for (x in 0 until n) {
@@ -461,19 +538,17 @@ fun Waveform(d: DeckState, accent: Color, modifier: Modifier) {
  * Arrastrar = mover la pista; doble toque = cambiar el zoom (3 / 6 / 12 s).
  */
 @Composable
-fun ZoomWave(d: DeckState, accent: Color, modifier: Modifier) {
+fun ZoomWave(d: DeckState, accent: Color, modifier: Modifier, onZoom: () -> Unit) {
     Canvas(
         modifier.clip(RoundedCornerShape(6.dp)).background(Color(0xFF05080F))
             .pointerInput(d) {
-                detectTapGestures(onDoubleTap = {
-                    d.zoomSec = when { d.zoomSec <= 3.5f -> 6f; d.zoomSec <= 7f -> 12f; else -> 3f }
-                })
+                detectTapGestures(onDoubleTap = { onZoom() })
             }
             .pointerInput(d) {
                 detectHorizontalDragGestures { change, dx ->
                     change.consume()
                     if (d.duration > 0) {
-                        val secPerPx = d.zoomSec / size.width
+                        val secPerPx = d.zoomSec * (1f + d.tempoPct / 100f) / size.width
                         NativeEngine.seekSeconds(d.index, (d.position - dx * secPerPx).coerceIn(0.0, d.duration))
                     }
                 }
@@ -482,7 +557,9 @@ fun ZoomWave(d: DeckState, accent: Color, modifier: Modifier) {
         val w = size.width
         val h = size.height
         val mid = h / 2f
-        val span = d.zoomSec
+        // la ventana es de tiempo real: con pitch distinto la pista ocupa mas/menos segundos, y asi los beats
+        // de dos decks sincronizados quedan alineados en pantalla
+        val span = d.zoomSec * (1f + d.tempoPct / 100f)
         val pos = d.position
         val det = d.detail
         val t0 = pos - span / 2.0
@@ -706,85 +783,76 @@ fun Jog(d: DeckState, accent: Color, modifier: Modifier) {
 
 // ---------- mezclador ----------
 
+/** Centro: EQ (4 perillas por deck), faders de volumen verticales, VU y crossfader abajo. */
 @Composable
 fun Mixer(
     decks: List<DeckState>, crossfader: Float,
     onCrossfader: (Float) -> Unit, onResetVol: () -> Unit, modifier: Modifier
 ) {
-    BoxWithConstraints(modifier.fillMaxHeight().clip(RoundedCornerShape(10.dp)).background(PANEL).padding(6.dp)) {
-        val bottom = 128.dp  // alto reservado para volumenes, crossfader y RESET
-        val cell = ((maxHeight - bottom) / 4).coerceIn(40.dp, 62.dp)
-        val knob = cell - 19.dp
-        Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Row(Modifier.fillMaxWidth().height(cell * 4), horizontalArrangement = Arrangement.SpaceBetween) {
-                KnobColumn(decks[0], CYAN, knob, cell, Modifier.weight(1f))
-                Row(
-                    Modifier.fillMaxHeight().padding(vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(3.dp)
-                ) {
-                    Vu(decks[0].level, Modifier.width(9.dp).fillMaxHeight())
-                    Vu(decks[1].level, Modifier.width(9.dp).fillMaxHeight())
+    Column(
+        modifier.fillMaxHeight().clip(RoundedCornerShape(10.dp)).background(PANEL).padding(6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+            val cell = (maxHeight / 4).coerceIn(30.dp, 56.dp)
+            val knob = cell - 3.dp
+            Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+                KnobColumn(decks[0], CYAN, knob, cell, true, Modifier.weight(1f))
+                VFader(
+                    decks[0].volume, 0f, 1f, CYAN,
+                    onChange = { decks[0].volume = it; NativeEngine.setVolume(0, it) },
+                    onReset = { decks[0].volume = 1f; NativeEngine.setVolume(0, 1f) },
+                    modifier = Modifier.width(26.dp).fillMaxHeight()
+                )
+                Row(Modifier.fillMaxHeight().padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Vu(decks[0].level, Modifier.width(8.dp).fillMaxHeight())
+                    Vu(decks[1].level, Modifier.width(8.dp).fillMaxHeight())
                 }
-                KnobColumn(decks[1], PINK, knob, cell, Modifier.weight(1f))
+                VFader(
+                    decks[1].volume, 0f, 1f, PINK,
+                    onChange = { decks[1].volume = it; NativeEngine.setVolume(1, it) },
+                    onReset = { decks[1].volume = 1f; NativeEngine.setVolume(1, 1f) },
+                    modifier = Modifier.width(26.dp).fillMaxHeight()
+                )
+                KnobColumn(decks[1], PINK, knob, cell, false, Modifier.weight(1f))
             }
-            Spacer(Modifier.weight(1f))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("VOL A", color = CYAN, fontSize = 10.sp)
-                    Slider(
-                        value = decks[0].volume, valueRange = 0f..1f,
-                        onValueChange = { decks[0].volume = it; NativeEngine.setVolume(0, it) },
-                        colors = SliderDefaults.colors(thumbColor = CYAN, activeTrackColor = CYAN),
-                        modifier = Modifier.height(28.dp)
-                    )
-                }
-                Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("VOL B", color = PINK, fontSize = 10.sp)
-                    Slider(
-                        value = decks[1].volume, valueRange = 0f..1f,
-                        onValueChange = { decks[1].volume = it; NativeEngine.setVolume(1, it) },
-                        colors = SliderDefaults.colors(thumbColor = PINK, activeTrackColor = PINK),
-                        modifier = Modifier.height(28.dp)
-                    )
-                }
-            }
-            Text(
-                "X-FADER (toca = centro)", color = Color.White, fontSize = 10.sp,
-                modifier = Modifier.clickable { onCrossfader(0.5f) }
-            )
+        }
+        Row(Modifier.fillMaxWidth().height(28.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            SmallButton("VOL↺", YELLOW, Modifier.width(48.dp).fillMaxHeight()) { onResetVol() }
             Slider(
                 value = crossfader, valueRange = 0f..1f, onValueChange = onCrossfader,
                 colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = GREEN),
-                modifier = Modifier.height(28.dp)
+                modifier = Modifier.weight(1f).height(28.dp)
             )
-            SmallButton("RESET VOL", YELLOW, Modifier.fillMaxWidth().height(26.dp)) { onResetVol() }
+            SmallButton("C", Color.White, Modifier.width(28.dp).fillMaxHeight()) { onCrossfader(0.5f) }
         }
     }
 }
 
 @Composable
-private fun KnobColumn(d: DeckState, accent: Color, knob: Dp, cell: Dp, modifier: Modifier) {
+private fun KnobColumn(d: DeckState, accent: Color, knob: Dp, cell: Dp, labelFirst: Boolean, modifier: Modifier) {
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
-        Knob(d.eqHigh, { d.eqHigh = it; d.pushEq() }, "HIGH", accent, knob, cell)
-        Knob(d.eqMid, { d.eqMid = it; d.pushEq() }, "MID", accent, knob, cell)
-        Knob(d.eqLow, { d.eqLow = it; d.pushEq() }, "LOW", accent, knob, cell)
-        Knob(d.filter, { d.filter = it; NativeEngine.setFilter(d.index, it) }, "FILTER", YELLOW, knob, cell)
+        Knob(d.eqHigh, { d.eqHigh = it; d.pushEq() }, "HIGH", accent, knob, cell, labelFirst)
+        Knob(d.eqMid, { d.eqMid = it; d.pushEq() }, "MID", accent, knob, cell, labelFirst)
+        Knob(d.eqLow, { d.eqLow = it; d.pushEq() }, "LOW", accent, knob, cell, labelFirst)
+        Knob(d.filter, { d.filter = it; NativeEngine.setFilter(d.index, it) }, "FILTER", YELLOW, knob, cell, labelFirst)
     }
 }
 
 /**
  * Perilla rotativa de -1 a 1: se arrastra hacia arriba/abajo y un doble toque la deja en el centro (0).
- * En rojo cuando anula la banda (EQ) o cierra por completo el filtro.
+ * En rojo cuando anula la banda (EQ) o cierra por completo el filtro. La etiqueta va al costado.
  */
 @Composable
-fun Knob(value: Float, onChange: (Float) -> Unit, label: String, color: Color, diameter: Dp, cell: Dp) {
+fun Knob(value: Float, onChange: (Float) -> Unit, label: String, color: Color, diameter: Dp, cell: Dp, labelFirst: Boolean) {
     val v by rememberUpdatedState(value)
     val change by rememberUpdatedState(onChange)
-    Column(
-        Modifier.height(cell),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+    Row(
+        Modifier.height(cell).fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
     ) {
+        if (labelFirst) Text(label, color = MUTED, fontSize = 9.sp, maxLines = 1, modifier = Modifier.width(32.dp))
         Canvas(
             Modifier.size(diameter)
                 .pointerInput(Unit) { detectTapGestures(onDoubleTap = { change(0f) }) }
@@ -822,7 +890,7 @@ fun Knob(value: Float, onChange: (Float) -> Unit, label: String, color: Color, d
                 strokeWidth = stroke * 0.5f, cap = StrokeCap.Round
             )
         }
-        Text(label, color = MUTED, fontSize = 9.sp, lineHeight = 10.sp, maxLines = 1)
+        if (!labelFirst) Text(label, color = MUTED, fontSize = 9.sp, maxLines = 1, modifier = Modifier.width(32.dp).padding(start = 4.dp))
     }
 }
 

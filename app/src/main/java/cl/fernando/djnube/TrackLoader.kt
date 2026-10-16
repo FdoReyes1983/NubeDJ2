@@ -11,7 +11,11 @@ import java.nio.ByteOrder
 /** Decodifica un archivo de audio a PCM int16 estereo y lo entrega al motor nativo. */
 object TrackLoader {
 
-    fun load(context: Context, uri: Uri, deck: Int): String {
+    /**
+     * Decodifica el archivo. onPlayable(titulo) se llama en cuanto hay ~2.5 s listos: desde ahi la pista
+     * ya se puede tocar mientras sigue cargando. Devuelve el titulo al terminar de decodificar.
+     */
+    fun load(context: Context, uri: Uri, deck: Int, onPlayable: (String) -> Unit = {}): String {
         val title = displayName(context, uri)
         val extractor = MediaExtractor()
         val pfd = requireNotNull(context.contentResolver.openFileDescriptor(uri, "r")) {
@@ -52,6 +56,8 @@ object TrackLoader {
         var inputDone = false
         var outputDone = false
         var begun = false
+        var published = false
+        var fedFrames = 0L
         var raw = ShortArray(0)
         var stereo = ShortArray(0)
 
@@ -97,6 +103,11 @@ object TrackLoader {
                                 else -> for (i in 0 until frames) { stereo[2 * i] = raw[i * ch]; stereo[2 * i + 1] = raw[i * ch + 1] }
                             }
                             NativeEngine.loadAppend(deck, stereo, frames)
+                            fedFrames += frames
+                            if (!published && fedFrames >= sampleRate * 5L / 2L) {
+                                published = NativeEngine.loadPublish(deck)
+                                if (published) onPlayable(title)
+                            }
                         }
                         codec.releaseOutputBuffer(ob, false)
                         if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
@@ -108,6 +119,9 @@ object TrackLoader {
                     }
                 }
             }
+        } catch (e: Throwable) {
+            if (published) NativeEngine.loadEnd(deck)       // deja lo ya decodificado en un estado valido
+            throw e
         } finally {
             runCatching { codec.stop() }
             codec.release()
@@ -115,6 +129,7 @@ object TrackLoader {
         }
 
         check(begun && NativeEngine.loadEnd(deck)) { "No se pudo decodificar el audio" }
+        if (!published) onPlayable(title)                   // pista corta: se publica al terminar
 
         // El BPM se calcula aparte (en segundo plano) para que la pista se pueda tocar al tiro.
         NativeEngine.setBpm(deck, 0f, 0.0)

@@ -9,6 +9,8 @@ object NativeEngine {
 
     external fun loadBegin(deck: Int, sampleRate: Int, estFrames: Int)
     external fun loadAppend(deck: Int, pcm: ShortArray, frames: Int)
+    external fun loadPublish(deck: Int): Boolean
+    external fun getLoadFraction(deck: Int): Float
     external fun loadEnd(deck: Int): Boolean
 
     external fun setPlaying(deck: Int, playing: Boolean)
