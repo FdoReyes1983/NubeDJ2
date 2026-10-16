@@ -21,6 +21,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -270,46 +272,18 @@ fun DjApp() {
             val nz = when { decks[0].zoomSec <= 3.5f -> 6f; decks[0].zoomSec <= 7f -> 12f; else -> 3f }
             decks.forEach { it.zoomSec = nz }
         }
-        val mixerW = 250.dp
+        val resetVol = {
+            decks.forEach { it.volume = 1f; NativeEngine.setVolume(it.index, 1f) }
+            say("Volumen de ambos decks al maximo")
+        }
+        val onCross: (Float) -> Unit = { crossfader = it; NativeEngine.setCrossfader(it) }
 
         Box(Modifier.fillMaxSize().background(BG)) {
-            Column(
-                Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(6.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                // cabecera: titulo, BPM y tiempo de cada deck + pestanas de modo en el centro
-                Row(Modifier.fillMaxWidth().height(30.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    DeckHeader(decks[0], CYAN, Modifier.weight(1f)) { openPicker(decks[0]) }
-                    Row(Modifier.width(mixerW), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                        listOf("DECK", "LOOP", "FX").forEachIndexed { i, label ->
-                            SmallButton(label, Color.White, Modifier.weight(1f).fillMaxHeight(), filled = mode == i) { mode = i }
-                        }
-                    }
-                    DeckHeader(decks[1], PINK, Modifier.weight(1f)) { openPicker(decks[1]) }
-                }
-                // pista completa de cada deck (tocar = saltar)
-                Row(Modifier.fillMaxWidth().height(12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Waveform(decks[0], CYAN, Modifier.weight(1f).fillMaxHeight())
-                    Spacer(Modifier.width(mixerW))
-                    Waveform(decks[1], PINK, Modifier.weight(1f).fillMaxHeight())
-                }
-                // los dos waveforms ampliados, juntos y a la misma escala de tiempo real: se ve la sincronia
-                Column(Modifier.fillMaxWidth().weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    ZoomWave(decks[0], CYAN, Modifier.fillMaxWidth().weight(1f), cycleZoom)
-                    ZoomWave(decks[1], PINK, Modifier.fillMaxWidth().weight(1f), cycleZoom)
-                }
-                Row(Modifier.fillMaxWidth().weight(1.7f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    DeckArea(decks[0], decks[1], CYAN, mode, Modifier.weight(1f), say)
-                    Mixer(
-                        decks, crossfader,
-                        onCrossfader = { crossfader = it; NativeEngine.setCrossfader(it) },
-                        onResetVol = {
-                            decks.forEach { it.volume = 1f; NativeEngine.setVolume(it.index, 1f) }
-                            say("Volumen de ambos decks al maximo")
-                        },
-                        modifier = Modifier.width(mixerW)
-                    )
-                    DeckArea(decks[1], decks[0], PINK, mode, Modifier.weight(1f), say)
+            BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).padding(6.dp)) {
+                if (maxWidth > maxHeight) {
+                    LandscapeLayout(decks, mode, { mode = it }, crossfader, onCross, resetVol, openPicker, cycleZoom, say)
+                } else {
+                    PortraitLayout(decks, crossfader, onCross, resetVol, openPicker, cycleZoom, say)
                 }
             }
             message?.let {
@@ -320,6 +294,104 @@ fun DjApp() {
                         .clickable { message = null }.padding(horizontal = 14.dp, vertical = 8.dp)
                 )
             }
+        }
+    }
+}
+
+/** Pantalla horizontal: dos platos a los lados, mezclador al centro, pestanas globales DECK / LOOP / FX. */
+@Composable
+fun LandscapeLayout(
+    decks: List<DeckState>, mode: Int, onMode: (Int) -> Unit,
+    crossfader: Float, onCrossfader: (Float) -> Unit, onResetVol: () -> Unit,
+    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit
+) {
+    val mixerW = 250.dp
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        // cabecera: titulo, BPM y tiempo de cada deck + pestanas de modo en el centro
+        Row(Modifier.fillMaxWidth().height(30.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            DeckHeader(decks[0], CYAN, Modifier.weight(1f)) { openPicker(decks[0]) }
+            Row(Modifier.width(mixerW), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                listOf("DECK", "LOOP", "FX").forEachIndexed { i, label ->
+                    SmallButton(label, Color.White, Modifier.weight(1f).fillMaxHeight(), filled = mode == i) { onMode(i) }
+                }
+            }
+            DeckHeader(decks[1], PINK, Modifier.weight(1f)) { openPicker(decks[1]) }
+        }
+        // pista completa de cada deck (tocar = saltar)
+        Row(Modifier.fillMaxWidth().height(12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Waveform(decks[0], CYAN, Modifier.weight(1f).fillMaxHeight())
+            Spacer(Modifier.width(mixerW))
+            Waveform(decks[1], PINK, Modifier.weight(1f).fillMaxHeight())
+        }
+        // los dos waveforms ampliados, juntos y a la misma escala de tiempo real: se ve la sincronia
+        Column(Modifier.fillMaxWidth().weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            ZoomWave(decks[0], CYAN, Modifier.fillMaxWidth().weight(1f), cycleZoom)
+            ZoomWave(decks[1], PINK, Modifier.fillMaxWidth().weight(1f), cycleZoom)
+        }
+        Row(Modifier.fillMaxWidth().weight(1.7f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            DeckArea(decks[0], decks[1], CYAN, mode, Modifier.weight(1f), say)
+            Mixer(decks, crossfader, onCrossfader, onResetVol, Modifier.width(mixerW))
+            DeckArea(decks[1], decks[0], PINK, mode, Modifier.weight(1f), say)
+        }
+    }
+}
+
+/**
+ * Pantalla vertical: se elige el plato 1, el 2 o MIX (ambos). Arriba titulo(s) y waveform(s), al medio el panel de la
+ * pestana elegida (DECK / LOOP / FX / EQ), y abajo selector de plato, CUE / PLAY / SYNC y crossfader.
+ */
+@Composable
+fun PortraitLayout(
+    decks: List<DeckState>, crossfader: Float, onCrossfader: (Float) -> Unit, onResetVol: () -> Unit,
+    openPicker: (DeckState) -> Unit, cycleZoom: () -> Unit, say: (String) -> Unit
+) {
+    var sel by remember { mutableIntStateOf(2) }     // 0 = plato 1, 1 = plato 2, 2 = MIX
+    var tab by remember { mutableIntStateOf(0) }     // 0 DECK, 1 LOOP, 2 FX, 3 EQ
+    val shown = when (sel) { 0 -> listOf(decks[0]); 1 -> listOf(decks[1]); else -> decks }
+    val accent = { x: DeckState -> if (x.index == 0) CYAN else PINK }
+    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        shown.forEach { x -> DeckHeader(x, accent(x), Modifier.fillMaxWidth().height(34.dp)) { openPicker(x) } }
+        shown.forEach { x -> Waveform(x, accent(x), Modifier.fillMaxWidth().height(12.dp)) }
+        Column(Modifier.fillMaxWidth().weight(if (sel == 2) 1.1f else 0.8f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            shown.forEach { x -> ZoomWave(x, accent(x), Modifier.fillMaxWidth().weight(1f), cycleZoom) }
+        }
+        Box(
+            Modifier.fillMaxWidth().weight(1.7f).clip(RoundedCornerShape(10.dp)).background(PANEL).padding(6.dp)
+        ) {
+            if (tab == 3) {
+                Mixer(decks, crossfader, onCrossfader, onResetVol, Modifier.fillMaxSize(), showCrossfader = false)
+            } else {
+                Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    shown.forEach { x ->
+                        Box(Modifier.weight(1f).fillMaxHeight()) {
+                            when (tab) {
+                                1 -> LoopPad(x, say)
+                                2 -> FxPad(x, accent(x))
+                                else -> DeckControls(x, accent(x), if (sel == 2) 2 else 1)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Row(Modifier.fillMaxWidth().height(32.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            listOf("DECK", "LOOP", "FX", "EQ").forEachIndexed { i, label ->
+                SmallButton(label, Color.White, Modifier.weight(1f).fillMaxHeight(), filled = tab == i) { tab = i }
+            }
+        }
+        // selector de plato: 1 | MIX | 2
+        Row(Modifier.fillMaxWidth().height(36.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            SmallButton("1", CYAN, Modifier.weight(1f).fillMaxHeight(), filled = sel == 0) { sel = 0 }
+            SmallButton("MIX", Color.White, Modifier.weight(1.4f).fillMaxHeight(), filled = sel == 2) { sel = 2 }
+            SmallButton("2", PINK, Modifier.weight(1f).fillMaxHeight(), filled = sel == 1) { sel = 1 }
+        }
+        Row(Modifier.fillMaxWidth().height(46.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            shown.forEach { x -> Transport(x, decks[1 - x.index], accent(x), say, Modifier.weight(1f).fillMaxHeight()) }
+        }
+        Row(Modifier.fillMaxWidth().height(34.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            SmallButton("VOL↺", YELLOW, Modifier.width(52.dp).fillMaxHeight()) { onResetVol() }
+            HFader(crossfader, onChange = onCrossfader, onReset = { onCrossfader(0.5f) }, modifier = Modifier.weight(1f).fillMaxHeight())
+            SmallButton("C", Color.White, Modifier.width(34.dp).fillMaxHeight()) { onCrossfader(0.5f) }
         }
     }
 }
@@ -361,65 +433,141 @@ fun DeckArea(d: DeckState, other: DeckState, accent: Color, mode: Int, modifier:
                 else -> DeckControls(d, accent)
             }
         }
-        Row(Modifier.fillMaxWidth().height(40.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            PadButton(
-                "CUE", YELLOW, Modifier.weight(1f).fillMaxHeight(),
-                onPress = { NativeEngine.cuePress(d.index) },
-                onRelease = { NativeEngine.cueRelease(d.index) }
-            )
-            PadButton(
-                if (d.playing) "PAUSA" else "PLAY", GREEN, Modifier.weight(1f).fillMaxHeight(),
-                onPress = { NativeEngine.setPlaying(d.index, !NativeEngine.isPlaying(d.index)) }
-            )
-            SmallButton("SYNC", accent, Modifier.weight(1f).fillMaxHeight(), filled = true) { doSync(d, other, say) }
-        }
+        Transport(d, other, accent, say, Modifier.fillMaxWidth().height(40.dp))
     }
 }
 
-/** Pestana DECK: jog (scratch), fader de pitch vertical y botones de BPM. */
+/** CUE / PLAY / SYNC de un deck. */
 @Composable
-fun DeckControls(d: DeckState, accent: Color) {
+fun Transport(d: DeckState, other: DeckState, accent: Color, say: (String) -> Unit, modifier: Modifier) {
+    Row(modifier, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+        PadButton(
+            "CUE", YELLOW, Modifier.weight(1f).fillMaxHeight(),
+            onPress = { NativeEngine.cuePress(d.index) },
+            onRelease = { NativeEngine.cueRelease(d.index) }
+        )
+        PadButton(
+            if (d.playing) "PAUSA" else "PLAY", GREEN, Modifier.weight(1f).fillMaxHeight(),
+            onPress = { NativeEngine.setPlaying(d.index, !NativeEngine.isPlaying(d.index)) }
+        )
+        SmallButton("SYNC", accent, Modifier.weight(1f).fillMaxHeight(), filled = true) { doSync(d, other, say) }
+    }
+}
+
+/**
+ * Pestana DECK. layout 0 = horizontal ancho (jog + fader de pitch + botones al costado), 1 = vertical de un plato
+ * (jog grande + fader, botones en una fila debajo), 2 = compacto para MIX (solo jog + fader de pitch).
+ */
+@Composable
+fun DeckControls(d: DeckState, accent: Color, layout: Int = 0) {
+    val rg = d.range.toFloat()
+    val pitch: @Composable (Modifier) -> Unit = { m ->
+        Column(m, horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("%+.1f%%".format(d.tempoPct), color = MUTED, fontSize = 9.sp, maxLines = 1)
+            VFader(
+                value = d.tempoPct.coerceIn(-rg, rg), min = -rg, max = rg, color = accent,
+                onChange = { v -> d.tempoPct = if (abs(v) < 0.25f) 0f else v; applyTempo(d) },
+                onReset = { d.tempoPct = 0f; applyTempo(d) },
+                modifier = Modifier.weight(1f).fillMaxWidth()
+            )
+        }
+    }
+    val rangeBtn: () -> Unit = {
+        d.range = RANGES[(RANGES.indexOf(d.range) + 1) % RANGES.size]
+        d.tempoPct = d.tempoPct.coerceIn(-d.range.toFloat(), d.range.toFloat())
+        applyTempo(d)
+    }
     BoxWithConstraints(Modifier.fillMaxSize()) {
-        val jog = minOf(maxHeight, maxWidth * 0.46f)
-        val rg = d.range.toFloat()
-        val bh = ((maxHeight - 8.dp) / 3).coerceIn(24.dp, 38.dp)
-        Row(
-            Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Jog(d, accent, Modifier.size(jog))
-            Column(Modifier.width(34.dp).height(jog), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("%+.1f".format(d.tempoPct), color = MUTED, fontSize = 9.sp, maxLines = 1)
-                VFader(
-                    value = d.tempoPct.coerceIn(-rg, rg), min = -rg, max = rg, color = accent,
-                    onChange = { v -> d.tempoPct = if (abs(v) < 0.25f) 0f else v; applyTempo(d) },
-                    onReset = { d.tempoPct = 0f; applyTempo(d) },
-                    modifier = Modifier.weight(1f).fillMaxWidth()
-                )
+        when (layout) {
+            2 -> Row(
+                Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Jog(d, accent, Modifier.size(minOf(maxHeight, maxWidth - 40.dp)))
+                pitch(Modifier.width(36.dp).fillMaxHeight())
             }
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    SmallButton("÷2", accent, Modifier.weight(1f).height(bh)) { scaleBpm(d, 0.5f) }
-                    SmallButton("×2", accent, Modifier.weight(1f).height(bh)) { scaleBpm(d, 2f) }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    SmallButton("TAP", YELLOW, Modifier.weight(1f).height(bh)) { registerTap(d) }
-                    SmallButton("SET", YELLOW, Modifier.weight(1f).height(bh)) { setAnchor(d) }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    SmallButton("±${d.range}", MUTED, Modifier.weight(1f).height(bh)) {
-                        d.range = RANGES[(RANGES.indexOf(d.range) + 1) % RANGES.size]
-                        d.tempoPct = d.tempoPct.coerceIn(-d.range.toFloat(), d.range.toFloat())
-                        applyTempo(d)
+            1 -> Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    BoxWithConstraints(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
+                        Jog(d, accent, Modifier.size(minOf(maxWidth, maxHeight)))
                     }
-                    SmallButton("RESET", YELLOW, Modifier.weight(1f).height(bh)) { d.tempoPct = 0f; applyTempo(d) }
+                    pitch(Modifier.width(40.dp).fillMaxHeight())
+                }
+                Row(Modifier.fillMaxWidth().height(34.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    SmallButton("÷2", accent, Modifier.weight(1f).fillMaxHeight()) { scaleBpm(d, 0.5f) }
+                    SmallButton("×2", accent, Modifier.weight(1f).fillMaxHeight()) { scaleBpm(d, 2f) }
+                    SmallButton("TAP", YELLOW, Modifier.weight(1f).fillMaxHeight()) { registerTap(d) }
+                    SmallButton("SET", YELLOW, Modifier.weight(1f).fillMaxHeight()) { setAnchor(d) }
+                    SmallButton("±${d.range}", MUTED, Modifier.weight(1f).fillMaxHeight()) { rangeBtn() }
+                    SmallButton("RESET", YELLOW, Modifier.weight(1.2f).fillMaxHeight()) { d.tempoPct = 0f; applyTempo(d) }
+                }
+            }
+            else -> {
+                val jog = minOf(maxHeight, maxWidth * 0.46f)
+                val bh = ((maxHeight - 8.dp) / 3).coerceIn(24.dp, 38.dp)
+                Row(
+                    Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Jog(d, accent, Modifier.size(jog))
+                    pitch(Modifier.width(34.dp).height(jog))
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            SmallButton("÷2", accent, Modifier.weight(1f).height(bh)) { scaleBpm(d, 0.5f) }
+                            SmallButton("×2", accent, Modifier.weight(1f).height(bh)) { scaleBpm(d, 2f) }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            SmallButton("TAP", YELLOW, Modifier.weight(1f).height(bh)) { registerTap(d) }
+                            SmallButton("SET", YELLOW, Modifier.weight(1f).height(bh)) { setAnchor(d) }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            SmallButton("±${d.range}", MUTED, Modifier.weight(1f).height(bh)) { rangeBtn() }
+                            SmallButton("RESET", YELLOW, Modifier.weight(1f).height(bh)) { d.tempoPct = 0f; applyTempo(d) }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/** Fader vertical (arriba = max). Arrastrar para mover, doble toque = onReset. */
+private val CAP_TOP = Color(0xFFD9DEE6)
+private val CAP_MID = Color(0xFF8E97A6)
+private val CAP_BOT = Color(0xFF4A5362)
+
+/** Tapa de fader estilo mesa de mezcla: cuerpo metalico con degradado, rayas de agarre y linea central de color. */
+private fun DrawScope.faderCap(center: Offset, w: Float, h: Float, vertical: Boolean, line: Color) {
+    val tl = Offset(center.x - w / 2f, center.y - h / 2f)
+    val r = androidx.compose.ui.geometry.CornerRadius(h.coerceAtMost(w) * 0.22f)
+    // sombra
+    drawRoundRect(Color.Black.copy(alpha = 0.45f), Offset(tl.x + 1.5f, tl.y + 3f), Size(w, h), r)
+    drawRoundRect(
+        brush = if (vertical) Brush.verticalGradient(listOf(CAP_TOP, CAP_MID, CAP_BOT), tl.y, tl.y + h)
+                else Brush.horizontalGradient(listOf(CAP_TOP, CAP_MID, CAP_BOT), tl.x, tl.x + w),
+        topLeft = tl, size = Size(w, h), cornerRadius = r
+    )
+    drawRoundRect(Color.White.copy(alpha = 0.35f), tl, Size(w, h), r, style = Stroke(1f))
+    // rayas de agarre
+    val g = Color.Black.copy(alpha = 0.35f)
+    if (vertical) {
+        for (k in -2..2) if (k != 0) {
+            val y = center.y + k * h * 0.17f
+            drawLine(g, Offset(tl.x + w * 0.12f, y), Offset(tl.x + w * 0.88f, y), 1.2f)
+        }
+        drawLine(line, Offset(tl.x + w * 0.08f, center.y), Offset(tl.x + w * 0.92f, center.y), 3.5f, StrokeCap.Round)
+    } else {
+        for (k in -2..2) if (k != 0) {
+            val x = center.x + k * w * 0.17f
+            drawLine(g, Offset(x, tl.y + h * 0.12f), Offset(x, tl.y + h * 0.88f), 1.2f)
+        }
+        drawLine(line, Offset(center.x, tl.y + h * 0.08f), Offset(center.x, tl.y + h * 0.92f), 3.5f, StrokeCap.Round)
+    }
+}
+
+/** Fader vertical (arriba = max): ranura hundida, marcas de escala y tapa metalica. Doble toque = onReset. */
 @Composable
 fun VFader(value: Float, min: Float, max: Float, color: Color, onChange: (Float) -> Unit, onReset: () -> Unit, modifier: Modifier) {
     val change by rememberUpdatedState(onChange)
@@ -430,23 +578,75 @@ fun VFader(value: Float, min: Float, max: Float, color: Color, onChange: (Float)
             .pointerInput(Unit) {
                 detectVerticalDragGestures { ch, _ ->
                     ch.consume()
-                    val f = 1f - (ch.position.y / size.height).coerceIn(0f, 1f)
+                    val capH = 22.dp.toPx()
+                    val f = 1f - ((ch.position.y - capH / 2f) / (size.height - capH)).coerceIn(0f, 1f)
                     change(min + f * (max - min))
                 }
             }
     ) {
+        val u = density
         val cx = size.width / 2f
-        val pad = 10f
+        val capW = minOf(size.width, 34f * u)
+        val capH = 22f * u
+        val top = capH / 2f
+        val bot = size.height - capH / 2f
         val f = ((value - min) / (max - min)).coerceIn(0f, 1f)
-        val y = pad + (1f - f) * (size.height - 2 * pad)
-        drawLine(Color(0xFF223049), Offset(cx, pad), Offset(cx, size.height - pad), 6f, StrokeCap.Round)
-        drawLine(color.copy(alpha = 0.8f), Offset(cx, size.height - pad), Offset(cx, y), 6f, StrokeCap.Round)
-        if (min < 0f) {   // marca del centro (pitch en 0)
-            val yc = pad + 0.5f * (size.height - 2 * pad)
-            drawLine(Color.White.copy(alpha = 0.6f), Offset(cx - 9f, yc), Offset(cx + 9f, yc), 2f)
+        val y = bot - f * (bot - top)
+        // marcas de escala (cada 10 %, largas en 0 / 50 / 100 %)
+        for (i in 0..10) {
+            val ty = bot - i / 10f * (bot - top)
+            val long = i == 0 || i == 5 || i == 10
+            val len = (if (long) 8f else 5f) * u
+            val c = Color.White.copy(alpha = if (long) 0.55f else 0.28f)
+            drawLine(c, Offset(cx - capW / 2f - 1f * u, ty), Offset(cx - capW / 2f - 1f * u + len, ty), 1f * u)
+            drawLine(c, Offset(cx + capW / 2f + 1f * u, ty), Offset(cx + capW / 2f + 1f * u - len, ty), 1f * u)
         }
-        drawRoundRect(Color.White, Offset(cx - 13f, y - 8f), Size(26f, 16f), androidx.compose.ui.geometry.CornerRadius(5f, 5f))
-        drawRoundRect(color, Offset(cx - 13f, y - 2f), Size(26f, 4f), androidx.compose.ui.geometry.CornerRadius(2f, 2f))
+        // ranura
+        val sw = 6f * u
+        drawRoundRect(Color(0xFF05080F), Offset(cx - sw / 2f, top - 2f), Size(sw, bot - top + 4f), androidx.compose.ui.geometry.CornerRadius(sw / 2f))
+        drawRoundRect(Color.White.copy(alpha = 0.10f), Offset(cx - sw / 2f, top - 2f), Size(sw, bot - top + 4f), androidx.compose.ui.geometry.CornerRadius(sw / 2f), style = Stroke(1f))
+        val fillFrom = if (min < 0f) (top + bot) / 2f else bot
+        drawLine(color.copy(alpha = 0.85f), Offset(cx, fillFrom), Offset(cx, y), 2.5f * u, StrokeCap.Round)
+        faderCap(Offset(cx, y), capW * 0.7f, capH, true, color)
+    }
+}
+
+/** Fader horizontal (crossfader): ranura con mitades de color A/B y tapa metalica. Doble toque = onReset. */
+@Composable
+fun HFader(value: Float, onChange: (Float) -> Unit, onReset: () -> Unit, modifier: Modifier) {
+    val change by rememberUpdatedState(onChange)
+    val reset by rememberUpdatedState(onReset)
+    Canvas(
+        modifier
+            .pointerInput(Unit) { detectTapGestures(onDoubleTap = { reset() }) }
+            .pointerInput(Unit) {
+                detectHorizontalDragGestures { ch, _ ->
+                    ch.consume()
+                    val capW = 22.dp.toPx()
+                    change(((ch.position.x - capW / 2f) / (size.width - capW)).coerceIn(0f, 1f))
+                }
+            }
+    ) {
+        val u = density
+        val cy = size.height / 2f
+        val capW = 22f * u
+        val capH = minOf(size.height, 30f * u)
+        val left = capW / 2f
+        val right = size.width - capW / 2f
+        val x = left + value.coerceIn(0f, 1f) * (right - left)
+        for (i in 0..10) {
+            val tx = left + i / 10f * (right - left)
+            val long = i == 0 || i == 5 || i == 10
+            val c = Color.White.copy(alpha = if (long) 0.55f else 0.28f)
+            val len = (if (long) 6f else 4f) * u
+            drawLine(c, Offset(tx, 1f * u), Offset(tx, 1f * u + len), 1f * u)
+            drawLine(c, Offset(tx, size.height - 1f * u), Offset(tx, size.height - 1f * u - len), 1f * u)
+        }
+        val sh = 6f * u
+        drawRoundRect(Color(0xFF05080F), Offset(left - 2f, cy - sh / 2f), Size(right - left + 4f, sh), androidx.compose.ui.geometry.CornerRadius(sh / 2f))
+        drawLine(CYAN.copy(alpha = 0.8f), Offset(left, cy), Offset((left + right) / 2f - 2f * u, cy), 2.5f * u, StrokeCap.Round)
+        drawLine(PINK.copy(alpha = 0.8f), Offset((left + right) / 2f + 2f * u, cy), Offset(right, cy), 2.5f * u, StrokeCap.Round)
+        faderCap(Offset(x, cy), capW, capH * 0.8f, false, Color.White)
     }
 }
 
@@ -787,7 +987,7 @@ fun Jog(d: DeckState, accent: Color, modifier: Modifier) {
 @Composable
 fun Mixer(
     decks: List<DeckState>, crossfader: Float,
-    onCrossfader: (Float) -> Unit, onResetVol: () -> Unit, modifier: Modifier
+    onCrossfader: (Float) -> Unit, onResetVol: () -> Unit, modifier: Modifier, showCrossfader: Boolean = true
 ) {
     Column(
         modifier.fillMaxHeight().clip(RoundedCornerShape(10.dp)).background(PANEL).padding(6.dp),
@@ -802,7 +1002,7 @@ fun Mixer(
                     decks[0].volume, 0f, 1f, CYAN,
                     onChange = { decks[0].volume = it; NativeEngine.setVolume(0, it) },
                     onReset = { decks[0].volume = 1f; NativeEngine.setVolume(0, 1f) },
-                    modifier = Modifier.width(26.dp).fillMaxHeight()
+                    modifier = Modifier.width(36.dp).fillMaxHeight()
                 )
                 Row(Modifier.fillMaxHeight().padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                     Vu(decks[0].level, Modifier.width(8.dp).fillMaxHeight())
@@ -812,19 +1012,17 @@ fun Mixer(
                     decks[1].volume, 0f, 1f, PINK,
                     onChange = { decks[1].volume = it; NativeEngine.setVolume(1, it) },
                     onReset = { decks[1].volume = 1f; NativeEngine.setVolume(1, 1f) },
-                    modifier = Modifier.width(26.dp).fillMaxHeight()
+                    modifier = Modifier.width(36.dp).fillMaxHeight()
                 )
                 KnobColumn(decks[1], PINK, knob, cell, false, Modifier.weight(1f))
             }
         }
-        Row(Modifier.fillMaxWidth().height(28.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            SmallButton("VOL↺", YELLOW, Modifier.width(48.dp).fillMaxHeight()) { onResetVol() }
-            Slider(
-                value = crossfader, valueRange = 0f..1f, onValueChange = onCrossfader,
-                colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = GREEN),
-                modifier = Modifier.weight(1f).height(28.dp)
-            )
-            SmallButton("C", Color.White, Modifier.width(28.dp).fillMaxHeight()) { onCrossfader(0.5f) }
+        if (showCrossfader) {
+            Row(Modifier.fillMaxWidth().height(32.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                SmallButton("VOL↺", YELLOW, Modifier.width(48.dp).fillMaxHeight()) { onResetVol() }
+                HFader(crossfader, onChange = onCrossfader, onReset = { onCrossfader(0.5f) }, modifier = Modifier.weight(1f).fillMaxHeight())
+                SmallButton("C", Color.White, Modifier.width(28.dp).fillMaxHeight()) { onCrossfader(0.5f) }
+            }
         }
     }
 }
@@ -865,12 +1063,13 @@ fun Knob(value: Float, onChange: (Float) -> Unit, label: String, color: Color, d
                 }
         ) {
             val vv = v.coerceIn(-1f, 1f)
-            val stroke = diameter.toPx() * 0.12f
+            val stroke = diameter.toPx() * 0.10f
             val rad = (size.minDimension - stroke) / 2f
             val c = center
             val topLeft = Offset(c.x - rad, c.y - rad)
             val box = Size(rad * 2f, rad * 2f)
             val arcColor = if (vv <= -0.97f) RED else color
+            // aro exterior (recorrido) + arco de valor
             drawArc(
                 color = Color(0xFF223049), startAngle = 135f, sweepAngle = 270f, useCenter = false,
                 topLeft = topLeft, size = box, style = Stroke(stroke, cap = StrokeCap.Round)
@@ -882,13 +1081,27 @@ fun Knob(value: Float, onChange: (Float) -> Unit, label: String, color: Color, d
                     topLeft = topLeft, size = box, style = Stroke(stroke, cap = StrokeCap.Round)
                 )
             }
+            // cuerpo metalico oscuro con brillo y borde
+            val body = rad - stroke * 0.9f
+            drawCircle(Color.Black.copy(alpha = 0.5f), body + 1.5f, Offset(c.x, c.y + 2f))
+            drawCircle(
+                brush = Brush.radialGradient(
+                    listOf(Color(0xFF4B566B), Color(0xFF232B3A), Color(0xFF111724)),
+                    center = Offset(c.x - body * 0.3f, c.y - body * 0.35f), radius = body * 1.5f
+                ),
+                radius = body, center = c
+            )
+            drawCircle(Color.White.copy(alpha = 0.18f), body, c, style = Stroke(1f))
+            // marca de posicion
             val a = Math.toRadians((270f + vv * 135f).toDouble()).toFloat()
             drawLine(
                 Color.White,
-                Offset(c.x + cos(a) * rad * 0.30f, c.y + sin(a) * rad * 0.30f),
-                Offset(c.x + cos(a) * rad * 0.80f, c.y + sin(a) * rad * 0.80f),
-                strokeWidth = stroke * 0.5f, cap = StrokeCap.Round
+                Offset(c.x + cos(a) * body * 0.30f, c.y + sin(a) * body * 0.30f),
+                Offset(c.x + cos(a) * body * 0.92f, c.y + sin(a) * body * 0.92f),
+                strokeWidth = stroke * 0.55f, cap = StrokeCap.Round
             )
+            // marca fija del centro (posicion neutra)
+            drawLine(Color.White.copy(alpha = 0.4f), Offset(c.x, topLeft.y - 1f), Offset(c.x, topLeft.y + stroke * 0.6f), 1.5f)
         }
         if (!labelFirst) Text(label, color = MUTED, fontSize = 9.sp, maxLines = 1, modifier = Modifier.width(32.dp).padding(start = 4.dp))
     }
