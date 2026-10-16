@@ -472,6 +472,20 @@ fun DeckControls(d: DeckState, accent: Color, layout: Int = 0) {
             )
         }
     }
+    val volCol: @Composable (Modifier) -> Unit = { m ->
+        Row(m, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+            Column(Modifier.weight(1f).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("VOL", color = MUTED, fontSize = 9.sp, maxLines = 1)
+                VFader(
+                    value = d.volume, min = 0f, max = 1f, color = accent,
+                    onChange = { v -> d.volume = v; NativeEngine.setVolume(d.index, v) },
+                    onReset = { d.volume = 1f; NativeEngine.setVolume(d.index, 1f) },
+                    modifier = Modifier.weight(1f).fillMaxWidth()
+                )
+            }
+            if (layout != 2) Vu(d.level, Modifier.width(7.dp).fillMaxHeight().padding(top = 14.dp, bottom = 4.dp))
+        }
+    }
     val rangeBtn: () -> Unit = {
         d.range = RANGES[(RANGES.indexOf(d.range) + 1) % RANGES.size]
         d.tempoPct = d.tempoPct.coerceIn(-d.range.toFloat(), d.range.toFloat())
@@ -485,7 +499,8 @@ fun DeckControls(d: DeckState, accent: Color, layout: Int = 0) {
                 Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Jog(d, accent, Modifier.size(minOf(boxH, boxW - 40.dp).coerceAtLeast(0.dp)))
+                volCol(Modifier.width(36.dp).fillMaxHeight())
+                Jog(d, accent, Modifier.size(minOf(boxH, boxW - 82.dp).coerceAtLeast(0.dp)))
                 pitch(Modifier.width(36.dp).fillMaxHeight())
             }
             1 -> Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -496,6 +511,7 @@ fun DeckControls(d: DeckState, accent: Color, layout: Int = 0) {
                     BoxWithConstraints(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
                         Jog(d, accent, Modifier.size(minOf(maxWidth, maxHeight).coerceAtLeast(0.dp)))
                     }
+                    volCol(Modifier.width(56.dp).fillMaxHeight())
                     pitch(Modifier.width(40.dp).fillMaxHeight())
                 }
                 Row(Modifier.fillMaxWidth().height(34.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -973,13 +989,74 @@ fun Jog(d: DeckState, accent: Color, modifier: Modifier) {
     ) {
         val r = size.minDimension / 2f
         val c = Offset(size.width / 2f, size.height / 2f)
-        drawCircle(Color(0xFF0C1320), r, c)
-        for (i in 1..5) drawCircle(Color(0xFF1B2638), r * (0.35f + i * 0.12f), c, style = Stroke(1f))
-        drawCircle(accent.copy(alpha = 0.8f), r, c, style = Stroke(3f))
         val ang = (d.position.toFloat() / SEC_PER_REV) * TWO_PI
-        val m = Offset(c.x + cos(ang) * r * 0.82f, c.y + sin(ang) * r * 0.82f)
-        drawCircle(Color.White, r * 0.06f, m)
-        drawCircle(accent, r * 0.12f, c)
+        // base con sombra
+        drawCircle(Color.Black.copy(alpha = 0.5f), r, Offset(c.x, c.y + 3f))
+        drawCircle(Color(0xFF0A0F1A), r, c)
+        // anillo de LEDs (estilo Pioneer): una cola luminosa sigue al cabezal
+        val leds = 60
+        val rl = r * 0.925f
+        val headA = ang - PI_F / 2f
+        for (k in 0 until leds) {
+            val a = k * TWO_PI / leds - PI_F / 2f
+            val dist = (((headA - a) % TWO_PI) + TWO_PI) % TWO_PI / TWO_PI
+            val on = if (dist < 0.30f) 1f - dist / 0.30f else 0f
+            drawCircle(
+                accent.copy(alpha = 0.14f + 0.86f * on),
+                r * (0.020f + 0.012f * on),
+                Offset(c.x + cos(a) * rl, c.y + sin(a) * rl)
+            )
+        }
+        // plato metalico (reflejos fijos, como el aluminio cepillado)
+        val rp = r * 0.85f
+        drawCircle(
+            brush = Brush.sweepGradient(
+                listOf(Color(0xFFE6EAF0), Color(0xFF8A93A1), Color(0xFFD3D8E0), Color(0xFF7B8493), Color(0xFFE6EAF0)),
+                center = c
+            ),
+            radius = rp, center = c
+        )
+        drawCircle(Color.White.copy(alpha = 0.5f), rp, c, style = Stroke(1.5f))
+        // marcas estroboscopicas del borde: giran con el disco
+        val ticks = 96
+        for (k in 0 until ticks) {
+            val a = ang + k * TWO_PI / ticks
+            val long = k % 8 == 0
+            val r0 = rp * (if (long) 0.90f else 0.94f)
+            drawLine(
+                Color.Black.copy(alpha = if (long) 0.65f else 0.35f),
+                Offset(c.x + cos(a) * r0, c.y + sin(a) * r0),
+                Offset(c.x + cos(a) * rp * 0.985f, c.y + sin(a) * rp * 0.985f),
+                if (long) 2.5f else 1.2f
+            )
+        }
+        // disco de vinilo con surcos y brillo
+        val rv = rp * 0.80f
+        drawCircle(Color(0xFF080B12), rv, c)
+        for (k in 1..7) drawCircle(Color(0xFF1A212E), rv * (0.42f + k * 0.075f), c, style = Stroke(1f))
+        drawCircle(
+            brush = Brush.sweepGradient(
+                listOf(
+                    Color.Transparent, Color.White.copy(alpha = 0.10f), Color.Transparent,
+                    Color.Transparent, Color.White.copy(alpha = 0.10f), Color.Transparent
+                ),
+                center = c
+            ),
+            radius = rv, center = c
+        )
+        // marca de posicion sobre el vinilo (gira)
+        drawLine(
+            Color.White,
+            Offset(c.x + cos(ang - PI_F / 2f) * rv * 0.45f, c.y + sin(ang - PI_F / 2f) * rv * 0.45f),
+            Offset(c.x + cos(ang - PI_F / 2f) * rv * 0.97f, c.y + sin(ang - PI_F / 2f) * rv * 0.97f),
+            r * 0.035f, StrokeCap.Round
+        )
+        // etiqueta central de color y eje
+        val rc = rv * 0.40f
+        drawCircle(accent, rc, c)
+        drawCircle(Color.Black.copy(alpha = 0.35f), rc, c, style = Stroke(r * 0.02f))
+        drawCircle(Color.Black.copy(alpha = 0.25f), rc * 0.62f, c, style = Stroke(1f))
+        drawCircle(Color(0xFFE6EAF0), r * 0.035f, c)
     }
 }
 
