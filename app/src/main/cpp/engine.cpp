@@ -555,6 +555,23 @@ JNI(jfloatArray, analyzeBpm)(JNIEnv* env, jobject, jint deck) {
     env->SetFloatArrayRegion(arr, 0, 2, res);
     return arr;
 }
+// Analiza un trozo de PCM (estereo int16 intercalado) sin pasar por ningun deck: lo usa el escaner de la biblioteca.
+// Devuelve {bpm, primerBeatSegundos relativo al inicio del trozo}; bpm = 0 si no se pudo detectar.
+JNI(jfloatArray, analyzePcm)(JNIEnv* env, jobject, jshortArray arr, jint frames, jint sampleRate) {
+    float res[2] = {0.f, 0.f};
+    if (arr != nullptr && frames > 0 && sampleRate > 0 && (jlong)frames * 2 <= (jlong)env->GetArrayLength(arr)) {
+        jshort* p = env->GetShortArrayElements(arr, nullptr);
+        if (p != nullptr) {
+            const dj::BpmResult r = dj::analyzeBpm(reinterpret_cast<const int16_t*>(p), frames, sampleRate);
+            res[0] = r.bpm;
+            res[1] = (float)r.firstBeat;
+            env->ReleaseShortArrayElements(arr, p, JNI_ABORT);
+        }
+    }
+    jfloatArray out = env->NewFloatArray(2);
+    env->SetFloatArrayRegion(out, 0, 2, res);
+    return out;
+}
 JNI(void, setBpm)(JNIEnv*, jobject, jint deck, jfloat bpm, jdouble firstBeat) {
     if (!validDeck(deck)) return;
     gEngine->decks[deck].bpm.store(bpm);

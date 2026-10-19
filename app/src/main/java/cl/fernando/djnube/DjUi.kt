@@ -1,9 +1,14 @@
 package cl.fernando.djnube
 
+import android.Manifest
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -40,6 +45,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -222,21 +228,51 @@ private fun persistRead(ctx: Context, uri: Uri) {
     }
 }
 
-private fun displayName(ctx: Context, uri: Uri): String {
+private fun nameAndSize(ctx: Context, uri: Uri): Found {
     var n: String? = null
+    var sz = 0L
     try {
-        ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-            if (c.moveToFirst()) n = c.getString(0)
+        ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                n = c.getString(0)
+                if (!c.isNull(1)) sz = c.getLong(1)
+            }
         }
     } catch (e: Exception) {
-        // sin nombre: se usa el final de la URI
+        // sin datos: se usa el final de la URI
     }
-    return (n ?: uri.lastPathSegment ?: "Pista").substringBeforeLast('.')
+    return Found(uri.toString(), (n ?: uri.lastPathSegment ?: "Pista").substringBeforeLast('.'), sz)
+}
+
+private val AUDIO_PERMISSION =
+    if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
+
+private fun hasAudioPermission(ctx: Context) =
+    ContextCompat.checkSelfPermission(ctx, AUDIO_PERMISSION) == PackageManager.PERMISSION_GRANTED
+
+/** Toda la musica del telefono (MediaStore): pistas de 60 s o mas, sin tonos de llamada, notificaciones ni alarmas. */
+private fun queryMediaStore(ctx: Context): List<Found> {
+    val out = ArrayList<Found>()
+    val base = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+    val proj = arrayOf(MediaStore.Audio.Media._ID, MediaStore.Audio.Media.DISPLAY_NAME, MediaStore.Audio.Media.SIZE)
+    val sel = MediaStore.Audio.Media.DURATION + " >= ? AND " + MediaStore.Audio.Media.IS_RINGTONE + " = 0 AND " +
+        MediaStore.Audio.Media.IS_NOTIFICATION + " = 0 AND " + MediaStore.Audio.Media.IS_ALARM + " = 0"
+    ctx.contentResolver.query(base, proj, sel, arrayOf("60000"), MediaStore.Audio.Media.DISPLAY_NAME + " ASC")?.use { c ->
+        val iId = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+        val iName = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+        val iSize = c.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
+        while (c.moveToNext()) {
+            val name = c.getString(iName) ?: continue
+            val uri = ContentUris.withAppendedId(base, c.getLong(iId))
+            out.add(Found(uri.toString(), name.substringBeforeLast('.'), c.getLong(iSize)))
+        }
+    }
+    return out
 }
 
 /** Recorre una carpeta elegida (hasta 6 niveles) y devuelve las pistas de audio como (uri, nombre). */
-private fun scanTree(ctx: Context, tree: Uri): List<Pair<String, String>> {
-    val out = ArrayList<Pair<String, String>>()
+private fun scanTree(ctx: Context, tree: Uri): List<Found> {
+    val out = ArrayList<Found>()
     fun walk(dir: DocumentFile, depth: Int) {
         for (f in dir.listFiles()) {
             if (f.isDirectory) {
@@ -244,7 +280,7 @@ private fun scanTree(ctx: Context, tree: Uri): List<Pair<String, String>> {
             } else {
                 val n = f.name ?: continue
                 val ext = n.substringAfterLast('.', "").lowercase()
-                if (f.type?.startsWith("audio/") == true || ext in AUDIO_EXT) out.add(f.uri.toString() to n.substringBeforeLast('.'))
+                if (f.type?.startsWith("audio/") == true || ext in AUDIO_EXT) out.add(Found(f.uri.toString(), n.substringBeforeLast('.'), f.length()))
             }
         }
     }
@@ -357,7 +393,7 @@ fun DjApp() {
         var libOpen by remember { mutableStateOf(false) }
         val addFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             if (uris.isNotEmpty()) {
-                val items = uris.map { u -> persistRead(ctx, u); u.toString() to displayName(ctx, u) }
+                val items = uris.map { u -> persistRead(ctx, u); nameAndSize(ctx, u) }
                 val n = Library.addAll(items)
                 say(if (n == 0) "Esas pistas ya estaban en la biblioteca" else "$n pistas agregadas")
             }
@@ -365,6 +401,7 @@ fun DjApp() {
         val addFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
             if (tree != null) scope.launch {
                 persistRead(ctx, tree)
+                Library.addFolder(tree.toString())
                 say("Buscando musica en la carpeta…")
                 val found = try {
                     withContext(Dispatchers.IO) { scanTree(ctx, tree) }
@@ -375,6 +412,30 @@ fun DjApp() {
                 val n = Library.addAll(found)
                 say("${found.size} pistas encontradas, $n nuevas")
             }
+        }
+        // Escaneo automatico: toda la musica del telefono (con permiso) + carpetas elegidas antes
+        val scanDevice: (Boolean) -> Unit = { silent ->
+            scope.launch {
+                if (!silent) say("Buscando musica…")
+                val found = withContext(Dispatchers.IO) {
+                    val all = ArrayList<Found>()
+                    if (hasAudioPermission(ctx)) {
+                        try { all.addAll(queryMediaStore(ctx)) } catch (e: Exception) { /* sin acceso a MediaStore */ }
+                    }
+                    for (f in Library.folders.toList()) {
+                        try { all.addAll(scanTree(ctx, Uri.parse(f))) } catch (e: Exception) { /* carpeta sin acceso */ }
+                    }
+                    all
+                }
+                val n = Library.addAll(found)
+                if (!silent || n > 0) say("${found.size} pistas encontradas, $n nuevas")
+            }
+        }
+        val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+            if (ok) scanDevice(false) else say("Sin permiso de audio: usa + CARPETA para elegir tu musica")
+        }
+        val onScanClick: () -> Unit = {
+            if (hasAudioPermission(ctx)) scanDevice(false) else permLauncher.launch(AUDIO_PERMISSION)
         }
         val loadFromLib: (LibTrack, Int) -> Unit = { t, i ->
             val d = decks[i]
@@ -494,7 +555,12 @@ fun DjApp() {
                 LibraryScreen(
                     onClose = { libOpen = false }, onLoad = loadFromLib,
                     onAddFiles = { addFiles.launch(arrayOf("audio/*")) },
-                    onAddFolder = { addFolder.launch(null) }
+                    onAddFolder = { addFolder.launch(null) },
+                    onScan = onScanClick,
+                    onAutoScan = { if (hasAudioPermission(ctx) || Library.folders.isNotEmpty()) scanDevice(true) },
+                    onBpmAll = { BpmScanner.scanAll(scope, ctx, say) },
+                    onBpmOne = { t -> BpmScanner.scanOne(scope, ctx, t, say) },
+                    onBpmStop = { BpmScanner.cancel() }
                 )
             }
             if (mixOpen) {
@@ -1510,12 +1576,17 @@ private fun ListButton(text: String, color: Color, filled: Boolean, modifier: Mo
     }
 }
 
-/** Biblioteca local: CANCIONES (orden A-Z o por BPM) e HISTORIAL; cada fila carga la pista en el deck A o B. */
+/** Biblioteca local: CANCIONES (A-Z o por BPM) e HISTORIAL; escaneo automatico, analisis de BPM masivo o por pista. */
 @Composable
-fun LibraryScreen(onClose: () -> Unit, onLoad: (LibTrack, Int) -> Unit, onAddFiles: () -> Unit, onAddFolder: () -> Unit) {
+fun LibraryScreen(
+    onClose: () -> Unit, onLoad: (LibTrack, Int) -> Unit, onAddFiles: () -> Unit, onAddFolder: () -> Unit,
+    onScan: () -> Unit, onAutoScan: () -> Unit, onBpmAll: () -> Unit, onBpmOne: (LibTrack) -> Unit, onBpmStop: () -> Unit
+) {
     var tab by remember { mutableIntStateOf(0) }       // 0 canciones, 1 historial
     var sort by remember { mutableIntStateOf(0) }      // 0 A-Z, 1 BPM
+    LaunchedEffect(Unit) { onAutoScan() }               // al abrir: busca musica nueva sin que hagas nada
     val all = Library.tracks.toList()
+    val pending = all.count { it.bpm <= 0f }
     val list = if (tab == 1) {
         all.filter { it.lastPlayed > 0L }.sortedByDescending { it.lastPlayed }
     } else if (sort == 1) {
@@ -1529,26 +1600,55 @@ fun LibraryScreen(onClose: () -> Unit, onLoad: (LibTrack, Int) -> Unit, onAddFil
             .pointerInput(Unit) { detectTapGestures { } }
     ) {
         Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(Modifier.fillMaxWidth().height(40.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth().height(38.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("BIBLIOTECA · ${all.size}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                SmallButton("+ ARCHIVOS", GREEN, Modifier.width(98.dp).fillMaxHeight()) { onAddFiles() }
-                SmallButton("+ CARPETA", GREEN, Modifier.width(92.dp).fillMaxHeight()) { onAddFolder() }
-                SmallButton("X", Color.White, Modifier.width(40.dp).fillMaxHeight()) { onClose() }
+                SmallButton("X", Color.White, Modifier.width(44.dp).fillMaxHeight()) { onClose() }
             }
             Row(Modifier.fillMaxWidth().height(36.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                SmallButton("ESCANEAR", GREEN, Modifier.weight(1.3f).fillMaxHeight(), filled = true) { onScan() }
+                SmallButton("+ ARCHIVOS", GREEN, Modifier.weight(1f).fillMaxHeight()) { onAddFiles() }
+                SmallButton("+ CARPETA", GREEN, Modifier.weight(1f).fillMaxHeight()) { onAddFolder() }
+            }
+            // analisis de BPM: masivo (todas las pistas sin BPM) con avance, o por pista tocando su BPM
+            if (BpmScanner.running) {
+                val frac = if (BpmScanner.total > 0) BpmScanner.done.toFloat() / BpmScanner.total else 0f
+                Row(
+                    Modifier.fillMaxWidth().height(40.dp).clip(RoundedCornerShape(8.dp)).background(PANEL).padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "Analizando BPM ${BpmScanner.done}/${BpmScanner.total} · ${BpmScanner.current}",
+                            color = Color.White, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                        )
+                        Box(Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)).background(BTN)) {
+                            Box(Modifier.fillMaxWidth(frac.coerceIn(0f, 1f)).fillMaxHeight().background(YELLOW))
+                        }
+                    }
+                    SmallButton("PARAR", RED, Modifier.width(64.dp).fillMaxHeight().padding(vertical = 4.dp)) { onBpmStop() }
+                }
+            } else {
+                SmallButton(
+                    if (pending > 0) "ANALIZAR BPM DE $pending PISTAS SIN BPM" else "TODAS LAS PISTAS TIENEN BPM",
+                    YELLOW, Modifier.fillMaxWidth().height(36.dp), filled = pending > 0
+                ) { onBpmAll() }
+            }
+            Row(Modifier.fillMaxWidth().height(34.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 SmallButton("CANCIONES", Color.White, Modifier.weight(1f).fillMaxHeight(), filled = tab == 0) { tab = 0 }
                 SmallButton("HISTORIAL", Color.White, Modifier.weight(1f).fillMaxHeight(), filled = tab == 1) { tab = 1 }
                 if (tab == 0) {
-                    SmallButton("A-Z", YELLOW, Modifier.width(56.dp).fillMaxHeight(), filled = sort == 0) { sort = 0 }
-                    SmallButton("BPM", YELLOW, Modifier.width(56.dp).fillMaxHeight(), filled = sort == 1) { sort = 1 }
+                    SmallButton("A-Z", YELLOW, Modifier.width(52.dp).fillMaxHeight(), filled = sort == 0) { sort = 0 }
+                    SmallButton("BPM", YELLOW, Modifier.width(52.dp).fillMaxHeight(), filled = sort == 1) { sort = 1 }
                 }
             }
             if (list.isEmpty()) {
                 Text(
                     if (tab == 1) "Aun no has tocado ninguna pista."
-                    else "Biblioteca vacia. Usa + ARCHIVOS o + CARPETA para agregar tu musica. El BPM se guarda solo la primera vez que cargas cada pista.",
+                    else "Biblioteca vacia. Toca ESCANEAR para buscar tu musica automaticamente (pide permiso de audio), o usa + CARPETA / + ARCHIVOS.",
                     color = MUTED, fontSize = 13.sp, modifier = Modifier.padding(12.dp)
                 )
+            } else if (tab == 0) {
+                Text("Toca el BPM de una pista para analizarla o volver a analizarla.", color = MUTED, fontSize = 10.sp)
             }
             LazyColumn(Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 items(list, key = { it.uri }) { t ->
@@ -1565,14 +1665,16 @@ fun LibraryScreen(onClose: () -> Unit, onLoad: (LibTrack, Int) -> Unit, onAddFil
                             }
                             Text(sub, color = MUTED, fontSize = 11.sp, maxLines = 1)
                         }
-                        Text(
-                            if (t.bpm > 0f) "%.1f".format(t.bpm) else "--",
-                            color = if (t.bpm > 0f) YELLOW else MUTED, fontSize = 15.sp, fontWeight = FontWeight.Bold
-                        )
-                        ListButton("A", CYAN, true, Modifier.width(40.dp).fillMaxHeight().padding(vertical = 7.dp)) { onLoad(t, 0) }
-                        ListButton("B", PINK, true, Modifier.width(40.dp).fillMaxHeight().padding(vertical = 7.dp)) { onLoad(t, 1) }
+                        val analyzing = t.uri in BpmScanner.busy || (BpmScanner.running && BpmScanner.current == t.name)
+                        ListButton(
+                            if (analyzing) "…" else if (t.bpm > 0f) "%.1f".format(t.bpm) else "BPM?",
+                            if (t.bpm > 0f) YELLOW else MUTED, false,
+                            Modifier.width(58.dp).fillMaxHeight().padding(vertical = 8.dp)
+                        ) { onBpmOne(t) }
+                        ListButton("A", CYAN, true, Modifier.width(38.dp).fillMaxHeight().padding(vertical = 7.dp)) { onLoad(t, 0) }
+                        ListButton("B", PINK, true, Modifier.width(38.dp).fillMaxHeight().padding(vertical = 7.dp)) { onLoad(t, 1) }
                         if (tab == 0) {
-                            ListButton("X", MUTED, false, Modifier.width(32.dp).fillMaxHeight().padding(vertical = 10.dp)) { Library.remove(t.uri) }
+                            ListButton("X", MUTED, false, Modifier.width(30.dp).fillMaxHeight().padding(vertical = 10.dp)) { Library.remove(t.uri) }
                         }
                     }
                 }

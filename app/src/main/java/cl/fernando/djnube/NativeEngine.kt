@@ -44,6 +44,8 @@ object NativeEngine {
     external fun setFx(deck: Int, type: Int, on: Boolean, x: Float, y: Float)
     external fun getDetail(deck: Int): FloatArray
     external fun analyzeBpm(deck: Int): FloatArray
+    /** Analiza un trozo de PCM estereo int16 sin deck (escaner de biblioteca). Devuelve [bpm, primerBeat relativo al trozo]. */
+    external fun analyzePcm(pcm: ShortArray, frames: Int, sampleRate: Int): FloatArray
     external fun setBpm(deck: Int, bpm: Float, firstBeat: Double)
     external fun getBpm(deck: Int): Float
     external fun getFirstBeat(deck: Int): Double

@@ -14,18 +14,31 @@ data class LibTrack(
     val firstBeat: Double = 0.0,
     val duration: Double = 0.0,
     val lastPlayed: Long = 0L,   // 0 = nunca tocada (no aparece en el historial)
-    val plays: Int = 0
+    val plays: Int = 0,
+    val size: Long = 0L          // bytes (0 = desconocido); sirve para no duplicar el mismo archivo
 )
+
+/** Pista encontrada por un escaneo, aun fuera de la biblioteca. */
+class Found(val uri: String, val name: String, val size: Long)
 
 /** Biblioteca local persistente (library.json en el almacenamiento privado de la app). */
 object Library {
     val tracks = mutableStateListOf<LibTrack>()
+    val folders = mutableStateListOf<String>()      // carpetas elegidas con + CARPETA (se reescanean)
     private var file: File? = null
+    private var folderFile: File? = null
 
     fun init(ctx: Context) {
         if (file != null) return
         val f = File(ctx.applicationContext.filesDir, "library.json")
         file = f
+        val ff = File(ctx.applicationContext.filesDir, "library_folders.txt")
+        folderFile = ff
+        try {
+            if (ff.exists()) ff.readLines().filter { it.isNotBlank() }.forEach { folders.add(it) }
+        } catch (e: Exception) {
+            // sin carpetas guardadas
+        }
         try {
             if (f.exists()) {
                 val a = JSONArray(f.readText())
@@ -39,7 +52,8 @@ object Library {
                             firstBeat = o.optDouble("fb", 0.0),
                             duration = o.optDouble("dur", 0.0),
                             lastPlayed = o.optLong("last", 0L),
-                            plays = o.optInt("plays", 0)
+                            plays = o.optInt("plays", 0),
+                            size = o.optLong("size", 0L)
                         )
                     )
                 }
@@ -58,7 +72,7 @@ object Library {
                     JSONObject()
                         .put("uri", t.uri).put("name", t.name).put("bpm", t.bpm.toDouble())
                         .put("fb", t.firstBeat).put("dur", t.duration)
-                        .put("last", t.lastPlayed).put("plays", t.plays)
+                        .put("last", t.lastPlayed).put("plays", t.plays).put("size", t.size)
                 )
             }
             f.writeText(a.toString())
@@ -76,13 +90,26 @@ object Library {
     }
 
     /** Agrega pistas (uri a nombre) que aun no estan. Devuelve cuantas eran nuevas. */
-    fun addAll(items: List<Pair<String, String>>): Int {
+    fun addAll(items: List<Found>): Int {
         var n = 0
-        for ((u, nm) in items) {
-            if (tracks.none { it.uri == u }) { tracks.add(LibTrack(u, nm)); n++ }
+        for (f in items) {
+            val dup = tracks.any {
+                it.uri == f.uri || (f.size > 0L && it.size == f.size && it.name.equals(f.name, ignoreCase = true))
+            }
+            if (!dup) { tracks.add(LibTrack(f.uri, f.name, size = f.size)); n++ }
         }
         if (n > 0) save()
         return n
+    }
+
+    fun addFolder(uri: String) {
+        if (uri in folders) return
+        folders.add(uri)
+        try {
+            folderFile?.writeText(folders.joinToString("\n"))
+        } catch (e: Exception) {
+            // se pierde solo el recordatorio de la carpeta
+        }
     }
 
     /** Se cargo en un deck: entra al historial. */
