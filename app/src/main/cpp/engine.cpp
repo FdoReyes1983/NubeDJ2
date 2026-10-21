@@ -62,11 +62,13 @@ struct Deck {
     std::atomic<double> loopStart{0.0}, loopEnd{0.0};
     std::atomic<int> fxType{1};
     std::atomic<bool> fxOn{false};
+    std::atomic<int> vocalMode{0};    // 0 normal, 1 sin voz, 2 solo voz
     std::atomic<float> fxX{0.5f}, fxY{0.5f};
     // solo hilo de audio
     double pos = 0.0;
     float rate = 0.f;
     dj::DeckFx fx;
+    dj::VocalFx vocal;
     dj::DeckEffects fxu;
 };
 
@@ -202,6 +204,7 @@ private:
         d.rate = rate;
         d.position.store(pos);
 
+        d.vocal.process(tmp, n, (float)outRate_, d.vocalMode.load());   // antes del EQ
         d.fx.process(tmp, n, (float)outRate_, d.eqLow.load(), d.eqMid.load(), d.eqHigh.load(),
                      d.filter.load());
 
@@ -533,6 +536,9 @@ JNI(void, setEq)(JNIEnv*, jobject, jint deck, jfloat low, jfloat mid, jfloat hig
     d.eqLow.store(std::clamp(low, -1.f, 1.f));
     d.eqMid.store(std::clamp(mid, -1.f, 1.f));
     d.eqHigh.store(std::clamp(high, -1.f, 1.f));
+}
+JNI(void, setVocal)(JNIEnv*, jobject, jint deck, jint mode) {
+    if (validDeck(deck)) gEngine->decks[deck].vocalMode.store(std::clamp((int)mode, 0, 2));
 }
 JNI(void, setFilter)(JNIEnv*, jobject, jint deck, jfloat v) {
     if (validDeck(deck)) gEngine->decks[deck].filter.store(std::clamp(v, -1.f, 1.f));

@@ -2,9 +2,12 @@ package cl.fernando.djnube
 
 import android.content.Context
 import androidx.compose.runtime.mutableStateListOf
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.Executors
 
 /** Una pista de la biblioteca: se identifica por su URI; guarda el BPM/primer beat para no recalcularlos. */
 data class LibTrack(
@@ -63,21 +66,27 @@ object Library {
         }
     }
 
+    // La escritura va en un hilo aparte: con miles de pistas el JSON ya no bloquea la pantalla.
+    private val writer = Executors.newSingleThreadExecutor()
+
     private fun save() {
         val f = file ?: return
-        try {
-            val a = JSONArray()
-            for (t in tracks) {
-                a.put(
-                    JSONObject()
-                        .put("uri", t.uri).put("name", t.name).put("bpm", t.bpm.toDouble())
-                        .put("fb", t.firstBeat).put("dur", t.duration)
-                        .put("last", t.lastPlayed).put("plays", t.plays).put("size", t.size)
-                )
+        val copy = tracks.toList()
+        writer.execute {
+            try {
+                val a = JSONArray()
+                for (t in copy) {
+                    a.put(
+                        JSONObject()
+                            .put("uri", t.uri).put("name", t.name).put("bpm", t.bpm.toDouble())
+                            .put("fb", t.firstBeat).put("dur", t.duration)
+                            .put("last", t.lastPlayed).put("plays", t.plays).put("size", t.size)
+                    )
+                }
+                f.writeText(a.toString())
+            } catch (e: Exception) {
+                // sin espacio o sin permisos: la biblioteca sigue funcionando en memoria
             }
-            f.writeText(a.toString())
-        } catch (e: Exception) {
-            // sin espacio o sin permisos: la biblioteca sigue funcionando en memoria
         }
     }
 
@@ -89,17 +98,32 @@ object Library {
         save()
     }
 
-    /** Agrega pistas (uri a nombre) que aun no estan. Devuelve cuantas eran nuevas. */
-    fun addAll(items: List<Found>): Int {
-        var n = 0
-        for (f in items) {
-            val dup = tracks.any {
-                it.uri == f.uri || (f.size > 0L && it.size == f.size && it.name.equals(f.name, ignoreCase = true))
+    /**
+     * Agrega las pistas que aun no estan (misma URI, o mismo nombre y tamano). Devuelve cuantas eran nuevas.
+     * El filtrado de duplicados va en segundo plano con tablas hash (antes era O(n^2) en el hilo de la UI y la congelaba).
+     */
+    suspend fun addAll(items: List<Found>): Int {
+        val existing = tracks.toList()
+        val fresh = withContext(Dispatchers.Default) {
+            val uris = HashSet<String>(existing.size * 2 + 16)
+            val keys = HashSet<String>(existing.size * 2 + 16)
+            for (t in existing) {
+                uris.add(t.uri)
+                if (t.size > 0L) keys.add(t.name.lowercase() + "|" + t.size)
             }
-            if (!dup) { tracks.add(LibTrack(f.uri, f.name, size = f.size)); n++ }
+            val out = ArrayList<LibTrack>()
+            for (f in items) {
+                if (!uris.add(f.uri)) continue
+                if (f.size > 0L && !keys.add(f.name.lowercase() + "|" + f.size)) continue
+                out.add(LibTrack(f.uri, f.name, size = f.size))
+            }
+            out
         }
-        if (n > 0) save()
-        return n
+        if (fresh.isNotEmpty()) {
+            tracks.addAll(fresh)
+            save()
+        }
+        return fresh.size
     }
 
     fun addFolder(uri: String) {

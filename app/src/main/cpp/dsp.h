@@ -115,4 +115,68 @@ private:
     bool fltOn_ = false, first_ = true;
 };
 
+// Quitar voz / dejar solo la voz (version rapida, sin IA): trabaja con el canal central (L+R)/2, donde casi siempre
+// va la voz principal. Se limita a la banda 150 Hz - 7 kHz para no tocar el bombo/bajo ni los platillos.
+//   modo 1 = SIN VOZ: se resta esa banda central de L y R (queda lo que esta a los lados + graves).
+//   modo 2 = SOLO VOZ: se deja solo la banda central, en mono.
+// El cambio de modo se mezcla con suavizado para evitar clicks.
+class VocalFx {
+public:
+    void process(float* buf, int frames, float fs, int mode) {
+        if (first_ || fs != fs_) {
+            const double q = 0.70710678;
+            cLo150_ = lowpass(fs, 150.0, q);
+            cHi150_ = highpass(fs, 150.0, q);
+            cLo7_ = lowpass(fs, 7000.0, q);
+            cHi7_ = highpass(fs, 7000.0, q);
+            fs_ = fs;
+            first_ = false;
+        }
+        const float tw = mode != 0 ? 1.f : 0.f;
+        if (mode != 0) mode_ = mode;
+        if (w_ < 0.0005f && tw == 0.f) {          // apagado del todo: sin costo y sin estado viejo
+            if (w_ != 0.f) { w_ = 0.f; resetAll(); }
+            return;
+        }
+        for (int i = 0; i < frames; ++i) {
+            w_ += (tw - w_) * 0.0015f;
+            const float l = buf[2 * i], r = buf[2 * i + 1];
+            const float m = 0.5f * (l + r);
+            // banda de voz: pasa-banda 150 Hz - 7 kHz (LR4) del canal central
+            const float band = bHpB_.process(0, bHpA_.process(0, bLpB_.process(0, bLpA_.process(0, m, cLo7_), cLo7_), cHi150_), cHi150_);
+            float pl, pr;
+            if (mode_ == 2) {
+                pl = pr = 1.15f * band;
+            } else {
+                // L y R pasan por all-pass con el MISMO desfase que el pasa-banda (LR4: baja + alta = all-pass),
+                // asi la resta cancela de verdad el centro dentro de la banda
+                pl = allpass(0, l) - 0.95f * band;
+                pr = allpass(1, r) - 0.95f * band;
+            }
+            buf[2 * i] = l + (pl - l) * w_;
+            buf[2 * i + 1] = r + (pr - r) * w_;
+        }
+    }
+
+private:
+    inline float allpass(int ch, float x) {
+        const float a = aLo150B_.process(ch, aLo150A_.process(ch, x, cLo150_), cLo150_) +
+                        aHi150B_.process(ch, aHi150A_.process(ch, x, cHi150_), cHi150_);
+        return aLo7B_.process(ch, aLo7A_.process(ch, a, cLo7_), cLo7_) +
+               aHi7B_.process(ch, aHi7A_.process(ch, a, cHi7_), cHi7_);
+    }
+    void resetAll() {
+        bLpA_.reset(); bLpB_.reset(); bHpA_.reset(); bHpB_.reset();
+        aLo150A_.reset(); aLo150B_.reset(); aHi150A_.reset(); aHi150B_.reset();
+        aLo7A_.reset(); aLo7B_.reset(); aHi7A_.reset(); aHi7B_.reset();
+    }
+
+    Biquad bLpA_, bLpB_, bHpA_, bHpB_;                         // pasa-banda del centro (estado del canal 0)
+    Biquad aLo150A_, aLo150B_, aHi150A_, aHi150B_, aLo7A_, aLo7B_, aHi7A_, aHi7B_;   // all-pass por canal
+    BiquadCoef cLo150_, cHi150_, cLo7_, cHi7_;
+    float w_ = 0.f, fs_ = 0.f;
+    int mode_ = 1;
+    bool first_ = true;
+};
+
 }  // namespace dj

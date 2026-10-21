@@ -94,6 +94,7 @@ class DeckState(val index: Int) {
     var fxType by mutableIntStateOf(1)          // 1 eco, 2 reverb, 3 flanger, 4 phaser, 5 gate
     var fxLock by mutableStateOf(false)
     var fxTouch by mutableStateOf(false)
+    var vocal by mutableIntStateOf(0)           // 0 normal, 1 sin voz, 2 solo voz
     var fxX by mutableFloatStateOf(0.5f)
     var fxY by mutableFloatStateOf(0.5f)
     var pendingSync by mutableStateOf(false)    // SYNC pedido mientras se calculaba el BPM
@@ -393,9 +394,11 @@ fun DjApp() {
         var libOpen by remember { mutableStateOf(false) }
         val addFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             if (uris.isNotEmpty()) {
-                val items = uris.map { u -> persistRead(ctx, u); nameAndSize(ctx, u) }
-                val n = Library.addAll(items)
-                say(if (n == 0) "Esas pistas ya estaban en la biblioteca" else "$n pistas agregadas")
+                scope.launch {
+                    val items = withContext(Dispatchers.IO) { uris.map { u -> persistRead(ctx, u); nameAndSize(ctx, u) } }
+                    val n = Library.addAll(items)
+                    say(if (n == 0) "Esas pistas ya estaban en la biblioteca" else "$n pistas agregadas")
+                }
             }
         }
         val addFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
@@ -414,8 +417,15 @@ fun DjApp() {
             }
         }
         // Escaneo automatico: toda la musica del telefono (con permiso) + carpetas elegidas antes
-        val scanDevice: (Boolean) -> Unit = { silent ->
+        var scanBusy by remember { mutableStateOf(false) }
+        val scanDevice: (Boolean) -> Unit = scanDevice@{ silent ->
+            if (scanBusy) {
+                if (!silent) say("Ya estoy buscando, espera un momento…")
+                return@scanDevice
+            }
+            scanBusy = true
             scope.launch {
+              try {
                 if (!silent) say("Buscando musica…")
                 val found = withContext(Dispatchers.IO) {
                     val all = ArrayList<Found>()
@@ -429,6 +439,9 @@ fun DjApp() {
                 }
                 val n = Library.addAll(found)
                 if (!silent || n > 0) say("${found.size} pistas encontradas, $n nuevas")
+              } finally {
+                scanBusy = false
+              }
             }
         }
         val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
@@ -1205,6 +1218,16 @@ fun FxPad(d: DeckState, accent: Color) {
                 }
             }
         }
+        Row(Modifier.fillMaxWidth().height(22.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+            SmallButton("SIN VOZ", GREEN, Modifier.weight(1f).fillMaxHeight(), filled = d.vocal == 1) {
+                d.vocal = if (d.vocal == 1) 0 else 1
+                NativeEngine.setVocal(d.index, d.vocal)
+            }
+            SmallButton("SOLO VOZ", GREEN, Modifier.weight(1f).fillMaxHeight(), filled = d.vocal == 2) {
+                d.vocal = if (d.vocal == 2) 0 else 2
+                NativeEngine.setVocal(d.index, d.vocal)
+            }
+        }
         Canvas(
             Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(Color(0xFF0B1220))
                 .border(1.dp, if (d.fxTouch || d.fxLock) PINK else Color(0xFF223049), RoundedCornerShape(8.dp))
@@ -1585,15 +1608,20 @@ fun LibraryScreen(
     var tab by remember { mutableIntStateOf(0) }       // 0 canciones, 1 historial
     var sort by remember { mutableIntStateOf(0) }      // 0 A-Z, 1 BPM
     LaunchedEffect(Unit) { onAutoScan() }               // al abrir: busca musica nueva sin que hagas nada
-    val all = Library.tracks.toList()
-    val pending = all.count { it.bpm <= 0f }
-    val list = if (tab == 1) {
-        all.filter { it.lastPlayed > 0L }.sortedByDescending { it.lastPlayed }
-    } else if (sort == 1) {
-        all.sortedWith(compareBy<LibTrack> { if (it.bpm <= 0f) 1 else 0 }.thenBy { it.bpm }.thenBy { it.name.lowercase() })
-    } else {
-        all.sortedBy { it.name.lowercase() }
+    // derivedStateOf: el orden se recalcula solo cuando cambia la biblioteca, no en cada avance del escaneo de BPM
+    val list by remember(tab, sort) {
+        derivedStateOf {
+            val all = Library.tracks.toList()
+            if (tab == 1) {
+                all.filter { it.lastPlayed > 0L }.sortedByDescending { it.lastPlayed }
+            } else if (sort == 1) {
+                all.sortedWith(compareBy<LibTrack> { if (it.bpm <= 0f) 1 else 0 }.thenBy { it.bpm }.thenBy { it.name.lowercase() })
+            } else {
+                all.sortedBy { it.name.lowercase() }
+            }
+        }
     }
+    val pending by remember { derivedStateOf { Library.tracks.count { it.bpm <= 0f } } }
     val dateFmt = remember { java.text.SimpleDateFormat("dd/MM HH:mm", java.util.Locale.getDefault()) }
     Box(
         Modifier.fillMaxSize().background(BG).windowInsetsPadding(WindowInsets.safeDrawing).padding(8.dp)
@@ -1601,7 +1629,7 @@ fun LibraryScreen(
     ) {
         Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(Modifier.fillMaxWidth().height(38.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("BIBLIOTECA · ${all.size}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Text("BIBLIOTECA · ${Library.tracks.size}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 SmallButton("X", Color.White, Modifier.width(44.dp).fillMaxHeight()) { onClose() }
             }
             Row(Modifier.fillMaxWidth().height(36.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {

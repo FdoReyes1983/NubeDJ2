@@ -36,6 +36,8 @@ object NativeEngine {
     external fun setEq(deck: Int, low: Float, mid: Float, high: Float)
     /** Filtro DJ: -1 = pasa-bajos cerrado, 0 = apagado, +1 = pasa-altos cerrado. */
     external fun setFilter(deck: Int, v: Float)
+    /** Voz: 0 = normal, 1 = sin voz (quita el canal central), 2 = solo voz. */
+    external fun setVocal(deck: Int, mode: Int)
 
     /** Analiza la pista cargada. Devuelve [bpm, primerBeatEnSegundos]; bpm = 0 si no lo detecta. */
     external fun setLoop(deck: Int, beats: Float): Boolean
