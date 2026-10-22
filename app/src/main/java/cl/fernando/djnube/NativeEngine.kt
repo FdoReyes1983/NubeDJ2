@@ -58,19 +58,15 @@ object NativeEngine {
      */
     external fun syncDeck(deck: Int): Float
 
-    // ---- separacion de voz con IA (ver Separator.kt) ----
-    external fun sepBegin(estFrames: Int, srcRate: Int)
-    external fun sepAppend(pcm: ShortArray, frames: Int)
-    /** Termina la lectura (pasa a 44.1 kHz) y devuelve cuantos bloques de IA hay que procesar; 0 = error. */
-    external fun sepPrepare(): Int
-    /** STFT del bloque [idx] en un buffer directo de 4*3072*256 floats. */
-    external fun sepStft(idx: Int, out: java.nio.ByteBuffer): Boolean
-    /** ISTFT de la salida del modelo para el bloque [idx]; guarda la voz de ese tramo. */
-    external fun sepIstft(idx: Int, model: FloatArray): Boolean
-    external fun sepFinish(vocPath: String, instPath: String): Boolean
-    external fun sepCancel()
-    /** Stems de IA de la pista cargada en el deck (si existen, SIN VOZ / SOLO VOZ los usan). */
-    external fun stemLoad(deck: Int, vocPath: String, instPath: String): Boolean
+    // ---- separacion de voz/instrumental con IA (ver Separator.kt) ----
+    /** Prepara la separacion de la pista ya cargada en el deck. Devuelve los bloques a procesar (0 = error). */
+    external fun stemPrepare(deck: Int): Int
+    /** STFT del bloque [p]: magnitudes en un buffer directo de 2*512*1024 floats. */
+    external fun stemInput(deck: Int, p: Int, out: java.nio.ByteBuffer): Boolean
+    /** Salida de los modelos voz / acompanamiento (buffers directos) para el bloque [p]. */
+    external fun stemApply(deck: Int, p: Int, yVocals: java.nio.ByteBuffer, yAccomp: java.nio.ByteBuffer): Boolean
+    external fun stemEnd(deck: Int)
     external fun stemClear(deck: Int)
-    external fun hasStems(deck: Int): Boolean
+    /** Fraccion ya separada de la pista del deck (0..1); -1 si no hay stems. */
+    external fun stemProgress(deck: Int): Float
 }

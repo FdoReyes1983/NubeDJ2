@@ -12,8 +12,8 @@ android {
         applicationId = "cl.fernando.djnube"
         minSdk = 26
         targetSdk = 35
-        versionCode = 17
-        versionName = "0.11.0"
+        versionCode = 18
+        versionName = "0.12.0"
 
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
         externalNativeBuild {
@@ -41,6 +41,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    androidResources { noCompress += "onnx" }
     packaging { jniLibs.pickFirsts += "**/libc++_shared.so" }
 }
 

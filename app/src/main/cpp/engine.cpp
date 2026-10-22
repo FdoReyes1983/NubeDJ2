@@ -7,7 +7,7 @@
 #include "bpm.h"
 #include "dsp.h"
 #include "fx.h"
-#include "sep.h"
+#include "stem.h"
 
 #include <algorithm>
 #include <atomic>
@@ -44,6 +44,7 @@ struct Track {
 struct Stems {
     std::vector<int16_t> voc, inst;
     int rate = 44100;
+    std::atomic<int64_t> avail{0};    // frames ya separados (la IA avanza por delante de la reproduccion)
     const Track* owner = nullptr;     // solo se usan mientras el deck siga con esa misma pista
 };
 
@@ -184,12 +185,15 @@ private:
         float* tmp = tmp_;
         // stems de IA (si hay para esta pista, SIN VOZ / SOLO VOZ los usan y el efecto rapido queda apagado)
         std::shared_ptr<Stems> st = std::atomic_load(&d.stems);
-        const bool useStems = st && st->owner == t.get() && !st->voc.empty() && st->voc.size() == st->inst.size();
         const int vmode = d.vocalMode.load();
+        const int64_t stAvail = st ? st->avail.load(std::memory_order_acquire) : 0;
+        // los stems se usan solo si la IA ya separo la zona que viene (si no, entra el efecto rapido)
+        const bool useStems = st && st->owner == t.get() && !st->voc.empty() && st->voc.size() == st->inst.size() &&
+                              d.pos * ((double)st->rate / (double)t->sampleRate) + 8192.0 < (double)stAvail;
         const float tInst = (useStems && vmode == 1) ? 1.f : 0.f;
         const float tVoc = (useStems && vmode == 2) ? 1.f : 0.f;
         const float tMix = 1.f - tInst - tVoc;
-        const int64_t stFrames = useStems ? (int64_t)(st->voc.size() / 2) : 0;
+        const int64_t stFrames = useStems ? stAvail : 0;
         const double stRatio = useStems ? (double)st->rate / (double)t->sampleRate : 1.0;
         float wMix = d.wMix, wInst = d.wInst, wVoc = d.wVoc;
         double pos = d.pos;
@@ -667,131 +671,75 @@ JNI(jfloat, syncDeck)(JNIEnv*, jobject, jint deck) {
     return r;
 }
 
-// ---- separacion de voz con IA (modelo MDX-Net en Kotlin/ONNX Runtime; aqui solo la parte de senal) ----
+// ---- separacion de voz/instrumental con IA (Spleeter ONNX corre en Kotlin; aqui la senal, ver stem.h) ----
 namespace {
 
-struct SepSession {
-    std::vector<int16_t> mix, voc;   // estereo intercalado a 44.1 kHz
-    int srcRate = 44100;
-    int64_t frames = 0;
+struct StemJob {
+    std::shared_ptr<Track> track;           // mantiene viva la pista cuyo PCM se lee
+    std::vector<int16_t> own;               // mezcla remuestreada a 44.1 kHz (si la pista no estaba a 44.1 kHz)
+    std::shared_ptr<Stems> stems;
+    std::unique_ptr<stem::Job> job;
 };
-std::unique_ptr<SepSession> gSep;
-constexpr int kGen = sep::kChunk - 2 * sep::kTrim;
-
-bool writeAll(const std::string& path, const std::vector<int16_t>& v) {
-    FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) return false;
-    const bool ok = std::fwrite(v.data(), 2, v.size(), f) == v.size();
-    return std::fclose(f) == 0 && ok;
-}
-bool readAll(const std::string& path, std::vector<int16_t>& v) {
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
-    std::fseek(f, 0, SEEK_END);
-    const long sz = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || (sz % 4) != 0) { std::fclose(f); return false; }
-    v.resize((size_t)sz / 2);
-    const bool ok = std::fread(v.data(), 2, v.size(), f) == v.size();
-    std::fclose(f);
-    return ok;
-}
-std::string jstr(JNIEnv* env, jstring s) {
-    const char* c = env->GetStringUTFChars(s, nullptr);
-    std::string r = c ? c : "";
-    if (c) env->ReleaseStringUTFChars(s, c);
-    return r;
-}
+std::unique_ptr<StemJob> gJobs[kDecks];
 
 }  // namespace
 
-JNI(void, sepBegin)(JNIEnv*, jobject, jint estFrames, jint srcRate) {
-    gSep = std::make_unique<SepSession>();
-    gSep->srcRate = srcRate > 0 ? srcRate : 44100;
-    if (estFrames > 0) gSep->mix.reserve((size_t)estFrames * 2);
-}
-JNI(void, sepAppend)(JNIEnv* env, jobject, jshortArray arr, jint frames) {
-    if (!gSep || frames <= 0) return;
-    const size_t old = gSep->mix.size();
-    gSep->mix.resize(old + (size_t)frames * 2);
-    env->GetShortArrayRegion(arr, 0, frames * 2, gSep->mix.data() + old);
-}
-// Termina la carga: pasa a 44.1 kHz si hace falta. Devuelve la cantidad de bloques de IA a procesar (0 = error).
-JNI(jint, sepPrepare)(JNIEnv*, jobject) {
-    if (!gSep || gSep->mix.size() < 4) return 0;
-    int64_t frames = (int64_t)(gSep->mix.size() / 2);
-    if (gSep->srcRate != 44100) {
-        std::vector<int16_t> r = sep::resampleStereo(gSep->mix.data(), frames, gSep->srcRate, 44100);
-        gSep->mix.swap(r);
-        std::vector<int16_t>().swap(r);
-        frames = (int64_t)(gSep->mix.size() / 2);
-    }
-    gSep->frames = frames;
-    gSep->voc.assign((size_t)frames * 2, 0);
-    return (jint)((frames + kGen - 1) / kGen);
-}
-// Calcula la STFT del bloque idx y la deja en el buffer directo `out` (4*3072*256 floats).
-JNI(jboolean, sepStft)(JNIEnv* env, jobject, jint idx, jobject out) {
-    if (!gSep || gSep->frames <= 0 || out == nullptr) return JNI_FALSE;
-    float* p = static_cast<float*>(env->GetDirectBufferAddress(out));
-    if (!p || env->GetDirectBufferCapacity(out) < (jlong)(4LL * sep::kDimF * sep::kDimT * 4)) return JNI_FALSE;
-    sep::stftChunk(gSep->mix.data(), gSep->frames, (int64_t)idx * kGen - sep::kTrim, p);
-    return JNI_TRUE;
-}
-// Recibe la salida del modelo del bloque idx (4*3072*256 floats), hace la ISTFT y guarda la voz de ese tramo.
-JNI(jboolean, sepIstft)(JNIEnv* env, jobject, jint idx, jfloatArray model) {
-    if (!gSep || gSep->frames <= 0) return JNI_FALSE;
-    if (env->GetArrayLength(model) < 4 * sep::kDimF * sep::kDimT) return JNI_FALSE;
-    static std::vector<float> out;
-    out.resize((size_t)2 * sep::kChunk);
-    jfloat* m = env->GetFloatArrayElements(model, nullptr);
-    if (!m) return JNI_FALSE;
-    sep::istftChunk(m, out.data());
-    env->ReleaseFloatArrayElements(model, m, JNI_ABORT);
-    const int64_t start = (int64_t)idx * kGen;
-    const int64_t n = std::min<int64_t>(kGen, gSep->frames - start);
-    for (int ch = 0; ch < 2; ++ch) {
-        const float* o = out.data() + (size_t)ch * sep::kChunk + sep::kTrim;
-        for (int64_t j = 0; j < n; ++j) {
-            const float v = std::clamp(o[j] * 1.009f, -1.f, 1.f);
-            gSep->voc[(size_t)(start + j) * 2 + ch] = (int16_t)std::lrintf(v * 32767.f);
-        }
-    }
-    return JNI_TRUE;
-}
-// Guarda voz.pcm e instrumental.pcm (instrumental = mezcla - voz) y libera la sesion.
-JNI(jboolean, sepFinish)(JNIEnv* env, jobject, jstring vocPath, jstring instPath) {
-    if (!gSep) return JNI_FALSE;
-    std::unique_ptr<SepSession> s = std::move(gSep);
-    const size_t n = s->mix.size();
-    std::vector<int16_t> inst(n);
-    for (size_t i = 0; i < n; ++i) {
-        inst[i] = (int16_t)std::clamp((int)s->mix[i] - (int)s->voc[i], -32768, 32767);
-    }
-    return writeAll(jstr(env, vocPath), s->voc) && writeAll(jstr(env, instPath), inst) ? JNI_TRUE : JNI_FALSE;
-}
-JNI(void, sepCancel)(JNIEnv*, jobject) { gSep.reset(); }
-
-// ---- stems de IA en un deck ----
-JNI(jboolean, stemLoad)(JNIEnv* env, jobject, jint deck, jstring vocPath, jstring instPath) {
-    if (!validDeck(deck)) return JNI_FALSE;
+// Prepara la separacion de la pista cargada en el deck (ya decodificada). Devuelve la cantidad de bloques; 0 = error.
+JNI(jint, stemPrepare)(JNIEnv*, jobject, jint deck) {
+    if (!validDeck(deck)) return 0;
     Deck& d = gEngine->decks[deck];
     std::shared_ptr<Track> t = std::atomic_load(&d.track);
-    if (!t) return JNI_FALSE;
-    auto st = std::make_shared<Stems>();
-    if (!readAll(jstr(env, vocPath), st->voc) || !readAll(jstr(env, instPath), st->inst)) return JNI_FALSE;
-    if (st->voc.size() != st->inst.size()) return JNI_FALSE;
-    st->owner = t.get();
-    std::atomic_store(&d.stems, st);
+    if (!t || !t->done.load()) return 0;
+    auto j = std::make_unique<StemJob>();
+    j->track = t;
+    const int16_t* mix = t->pcm.data();
+    int64_t frames = t->frames.load();
+    if (frames < 4096) return 0;
+    if (t->sampleRate != 44100) {
+        j->own = stem::resampleStereo(mix, frames, t->sampleRate, 44100);
+        mix = j->own.data();
+        frames = (int64_t)(j->own.size() / 2);
+    }
+    j->stems = std::make_shared<Stems>();
+    j->stems->rate = 44100;
+    j->stems->voc.assign((size_t)frames * 2, 0);
+    j->stems->inst.assign((size_t)frames * 2, 0);
+    j->stems->owner = t.get();
+    j->job = std::make_unique<stem::Job>(mix, frames, j->stems->voc.data(), j->stems->inst.data(), &j->stems->avail);
+    const int n = j->job->patches();
+    std::atomic_store(&d.stems, j->stems);        // el motor los usa a medida que avanza `avail`
+    gJobs[deck] = std::move(j);
+    return n;
+}
+// STFT del bloque p; magnitudes en el buffer directo `out` (2*512*1024 floats).
+JNI(jboolean, stemInput)(JNIEnv* env, jobject, jint deck, jint p, jobject out) {
+    if (!validDeck(deck) || !gJobs[deck] || out == nullptr) return JNI_FALSE;
+    float* o = static_cast<float*>(env->GetDirectBufferAddress(out));
+    if (!o || env->GetDirectBufferCapacity(out) < (jlong)(2LL * stem::kFr * stem::kBins * 4)) return JNI_FALSE;
+    gJobs[deck]->job->input(p, o);
     return JNI_TRUE;
+}
+// Salida de los dos modelos (voz y acompanamiento, buffers directos) para el bloque p: mascara, ISTFT y entrega.
+JNI(jboolean, stemApply)(JNIEnv* env, jobject, jint deck, jint p, jobject yv, jobject ya) {
+    if (!validDeck(deck) || !gJobs[deck] || !yv || !ya) return JNI_FALSE;
+    const float* v = static_cast<const float*>(env->GetDirectBufferAddress(yv));
+    const float* a = static_cast<const float*>(env->GetDirectBufferAddress(ya));
+    if (!v || !a) return JNI_FALSE;
+    gJobs[deck]->job->apply(p, v, a);
+    return JNI_TRUE;
+}
+JNI(void, stemEnd)(JNIEnv*, jobject, jint deck) {
+    if (validDeck(deck)) gJobs[deck].reset();      // el motor conserva los stems ya entregados (comparte su memoria)
 }
 JNI(void, stemClear)(JNIEnv*, jobject, jint deck) {
     if (validDeck(deck)) std::atomic_store(&gEngine->decks[deck].stems, std::shared_ptr<Stems>());
 }
-JNI(jboolean, hasStems)(JNIEnv*, jobject, jint deck) {
-    if (!validDeck(deck)) return JNI_FALSE;
+// Fraccion de la pista ya separada (0..1); -1 si el deck no tiene stems.
+JNI(jfloat, stemProgress)(JNIEnv*, jobject, jint deck) {
+    if (!validDeck(deck)) return -1.f;
     Deck& d = gEngine->decks[deck];
     std::shared_ptr<Stems> st = std::atomic_load(&d.stems);
     std::shared_ptr<Track> t = std::atomic_load(&d.track);
-    return st && t && st->owner == t.get() ? JNI_TRUE : JNI_FALSE;
+    if (!st || !t || st->owner != t.get() || st->voc.empty()) return -1.f;
+    return (float)((double)st->avail.load() / (double)(st->voc.size() / 2));
 }
