@@ -41,6 +41,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -95,6 +96,7 @@ class DeckState(val index: Int) {
     var fxLock by mutableStateOf(false)
     var fxTouch by mutableStateOf(false)
     var vocal by mutableIntStateOf(0)           // 0 normal, 1 sin voz, 2 solo voz
+    var stems by mutableStateOf(false)          // la pista tiene voz/instrumental separados con IA
     var fxX by mutableFloatStateOf(0.5f)
     var fxY by mutableFloatStateOf(0.5f)
     var pendingSync by mutableStateOf(false)    // SYNC pedido mientras se calculaba el BPM
@@ -297,11 +299,16 @@ fun DjApp() {
     MaterialTheme(colorScheme = darkColorScheme()) {
         val ctx = LocalContext.current
         val scope = rememberCoroutineScope()
-        remember { Library.init(ctx); true }
+        remember { Library.init(ctx); Separator.init(ctx); true }
         val decks = remember { listOf(DeckState(0), DeckState(1)) }
         var crossfader by remember { mutableFloatStateOf(0.5f) }
         var message by remember { mutableStateOf<String?>(null) }
         val say: (String) -> Unit = { message = it }
+        val view = LocalView.current
+        DisposableEffect(Separator.running) {            // mientras la IA trabaja, la pantalla no se apaga
+            view.keepScreenOn = Separator.running
+            onDispose { view.keepScreenOn = false }
+        }
 
         LaunchedEffect(Unit) {
             while (true) {
@@ -325,6 +332,7 @@ fun DjApp() {
                     d.loading = true
                     val gen = ++d.loadGen
                     d.analyzing = false
+                    d.stems = false
                     d.pendingSync = false
                     d.loopBeats = 0f
                     d.detail = null
@@ -350,6 +358,11 @@ fun DjApp() {
                         if (gen == d.loadGen) {
                             d.loading = false
                             Library.played(uriStr, title, NativeEngine.getDurationSeconds(d.index))
+                            // si la pista ya se separo con IA antes, se cargan sus stems
+                            if (Separator.has(uriStr)) {
+                                val ok = withContext(Dispatchers.IO) { Separator.attach(d.index, uriStr) }
+                                d.stems = ok && gen == d.loadGen
+                            }
                             val saved = Library.find(uriStr)
                             // BPM ya guardado en la biblioteca: se usa al instante, sin analizar
                             if (saved != null && saved.bpm > 0f) NativeEngine.setBpm(d.index, saved.bpm, saved.firstBeat)
@@ -573,7 +586,16 @@ fun DjApp() {
                     onAutoScan = { if (hasAudioPermission(ctx) || Library.folders.isNotEmpty()) scanDevice(true) },
                     onBpmAll = { BpmScanner.scanAll(scope, ctx, say) },
                     onBpmOne = { t -> BpmScanner.scanOne(scope, ctx, t, say) },
-                    onBpmStop = { BpmScanner.cancel() }
+                    onBpmStop = { BpmScanner.cancel() },
+                    onAi = { t ->
+                        Separator.start(scope, ctx, t.uri, t.name, say) { u ->
+                            // si esa pista esta cargada en algun deck, usa los stems de inmediato
+                            for (x in decks) if (x.uri == u && !x.loading) {
+                                scope.launch { x.stems = withContext(Dispatchers.IO) { Separator.attach(x.index, u) } }
+                            }
+                        }
+                    },
+                    onAiStop = { Separator.cancel() }
                 )
             }
             if (mixOpen) {
@@ -714,7 +736,7 @@ fun DeckHeader(d: DeckState, accent: Color, modifier: Modifier, onLoad: () -> Un
             modifier = Modifier.weight(1f)
         )
         if (d.vocal != 0) {
-            Text(if (d.vocal == 1) "SIN VOZ" else "SOLO VOZ", color = GREEN, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            Text((if (d.vocal == 1) "SIN VOZ" else "SOLO VOZ") + (if (d.stems) " IA" else ""), color = GREEN, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1)
         }
         Text(
             if (d.bpm > 0f) "%.1f".format(d.bpm * (1f + d.tempoPct / 100f)) else if (d.analyzing) "…" else "--",
@@ -1202,8 +1224,10 @@ private fun setVocal(d: DeckState, mode: Int, say: (String) -> Unit) {
     NativeEngine.setVocal(d.index, d.vocal)
     say(
         when (d.vocal) {
-            1 -> "Deck ${deckLetter(d)}: SIN VOZ activado (quita lo que esta al centro de la mezcla)"
-            2 -> "Deck ${deckLetter(d)}: SOLO VOZ activado (deja solo lo que esta al centro)"
+            1 -> if (d.stems) "Deck ${deckLetter(d)}: SIN VOZ con IA (solo el instrumental)"
+                 else "Deck ${deckLetter(d)}: SIN VOZ rapido (poco efecto). Separa la pista con el boton IA de la biblioteca para quitar la voz de verdad"
+            2 -> if (d.stems) "Deck ${deckLetter(d)}: SOLO VOZ con IA (solo la voz)"
+                 else "Deck ${deckLetter(d)}: SOLO VOZ rapido (poco efecto). Separa la pista con el boton IA de la biblioteca"
             else -> "Deck ${deckLetter(d)}: voz normal"
         }
     )
@@ -1612,7 +1636,8 @@ private fun ListButton(text: String, color: Color, filled: Boolean, modifier: Mo
 @Composable
 fun LibraryScreen(
     onClose: () -> Unit, onLoad: (LibTrack, Int) -> Unit, onAddFiles: () -> Unit, onAddFolder: () -> Unit,
-    onScan: () -> Unit, onAutoScan: () -> Unit, onBpmAll: () -> Unit, onBpmOne: (LibTrack) -> Unit, onBpmStop: () -> Unit
+    onScan: () -> Unit, onAutoScan: () -> Unit, onBpmAll: () -> Unit, onBpmOne: (LibTrack) -> Unit, onBpmStop: () -> Unit,
+    onAi: (LibTrack) -> Unit, onAiStop: () -> Unit
 ) {
     var tab by remember { mutableIntStateOf(0) }       // 0 canciones, 1 historial
     var sort by remember { mutableIntStateOf(0) }      // 0 A-Z, 1 BPM
@@ -1670,6 +1695,28 @@ fun LibraryScreen(
                     YELLOW, Modifier.fillMaxWidth().height(36.dp), filled = pending > 0
                 ) { onBpmAll() }
             }
+            // separacion de voz con IA: avance, tiempo restante y cancelar
+            if (Separator.running) {
+                Row(
+                    Modifier.fillMaxWidth().height(46.dp).clip(RoundedCornerShape(8.dp)).background(PANEL).padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "IA · ${Separator.phase} · ${Separator.name}",
+                            color = Color.White, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                        )
+                        Box(Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(3.dp)).background(BTN)) {
+                            Box(Modifier.fillMaxWidth(Separator.progress.coerceIn(0f, 1f)).fillMaxHeight().background(GREEN))
+                        }
+                        Text(
+                            "${(Separator.progress * 100).toInt()}%  ${Separator.eta}  ·  deja la app abierta",
+                            color = MUTED, fontSize = 10.sp, maxLines = 1
+                        )
+                    }
+                    SmallButton("PARAR", RED, Modifier.width(64.dp).fillMaxHeight().padding(vertical = 5.dp)) { onAiStop() }
+                }
+            }
             Row(Modifier.fillMaxWidth().height(34.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 SmallButton("CANCIONES", Color.White, Modifier.weight(1f).fillMaxHeight(), filled = tab == 0) { tab = 0 }
                 SmallButton("HISTORIAL", Color.White, Modifier.weight(1f).fillMaxHeight(), filled = tab == 1) { tab = 1 }
@@ -1708,10 +1755,16 @@ fun LibraryScreen(
                             if (t.bpm > 0f) YELLOW else MUTED, false,
                             Modifier.width(58.dp).fillMaxHeight().padding(vertical = 8.dp)
                         ) { onBpmOne(t) }
+                        val aiDone = t.uri in Separator.done
+                        val aiBusy = Separator.running && Separator.currentUri == t.uri
+                        ListButton(
+                            if (aiBusy) "…" else "IA", GREEN, aiDone,
+                            Modifier.width(36.dp).fillMaxHeight().padding(vertical = 7.dp)
+                        ) { onAi(t) }
                         ListButton("A", CYAN, true, Modifier.width(38.dp).fillMaxHeight().padding(vertical = 7.dp)) { onLoad(t, 0) }
                         ListButton("B", PINK, true, Modifier.width(38.dp).fillMaxHeight().padding(vertical = 7.dp)) { onLoad(t, 1) }
                         if (tab == 0) {
-                            ListButton("X", MUTED, false, Modifier.width(30.dp).fillMaxHeight().padding(vertical = 10.dp)) { Library.remove(t.uri) }
+                            ListButton("X", MUTED, false, Modifier.width(30.dp).fillMaxHeight().padding(vertical = 10.dp)) { Separator.delete(t.uri); Library.remove(t.uri) }
                         }
                     }
                 }

@@ -7,12 +7,15 @@
 #include "bpm.h"
 #include "dsp.h"
 #include "fx.h"
+#include "sep.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #define LOG_TAG "NubeDJ"
@@ -37,7 +40,15 @@ struct Track {
     std::vector<float> detail;   // 4 valores por bin de 5 ms: total, graves, medios, agudos (0..1)
 };
 
+// Stems separados con IA (voz e instrumental, estereo int16) de la pista cargada. Estan a su propia frecuencia (44.1 kHz).
+struct Stems {
+    std::vector<int16_t> voc, inst;
+    int rate = 44100;
+    const Track* owner = nullptr;     // solo se usan mientras el deck siga con esa misma pista
+};
+
 struct Deck {
+    std::shared_ptr<Stems> stems;    // acceder con std::atomic_load / atomic_store
     std::shared_ptr<Track> track;    // acceder con std::atomic_load / atomic_store
     std::shared_ptr<Track> loading;  // solo hilo de carga
     std::atomic<bool> playing{false};
@@ -67,6 +78,7 @@ struct Deck {
     // solo hilo de audio
     double pos = 0.0;
     float rate = 0.f;
+    float wMix = 1.f, wInst = 0.f, wVoc = 0.f;   // mezcla suavizada original / instrumental / voz
     dj::DeckFx fx;
     dj::VocalFx vocal;
     dj::DeckEffects fxu;
@@ -170,6 +182,16 @@ private:
         const double loopS = d.loopStart.load(), loopE = d.loopEnd.load();
         const double loopLen = loopE - loopS;
         float* tmp = tmp_;
+        // stems de IA (si hay para esta pista, SIN VOZ / SOLO VOZ los usan y el efecto rapido queda apagado)
+        std::shared_ptr<Stems> st = std::atomic_load(&d.stems);
+        const bool useStems = st && st->owner == t.get() && !st->voc.empty() && st->voc.size() == st->inst.size();
+        const int vmode = d.vocalMode.load();
+        const float tInst = (useStems && vmode == 1) ? 1.f : 0.f;
+        const float tVoc = (useStems && vmode == 2) ? 1.f : 0.f;
+        const float tMix = 1.f - tInst - tVoc;
+        const int64_t stFrames = useStems ? (int64_t)(st->voc.size() / 2) : 0;
+        const double stRatio = useStems ? (double)st->rate / (double)t->sampleRate : 1.0;
+        float wMix = d.wMix, wInst = d.wInst, wVoc = d.wVoc;
         double pos = d.pos;
         float rate = d.rate;
         for (int32_t i = 0; i < n; ++i) {
@@ -197,14 +219,34 @@ private:
                 l = (pcm[i0 * 2] + (pcm[i1 * 2] - pcm[i0 * 2]) * f) * k * g;
                 r = (pcm[i0 * 2 + 1] + (pcm[i1 * 2 + 1] - pcm[i0 * 2 + 1]) * f) * k * g;
             }
+            wMix += (tMix - wMix) * 0.002f;
+            wInst += (tInst - wInst) * 0.002f;
+            wVoc += (tVoc - wVoc) * 0.002f;
+            if (useStems && g > 0.f && (wInst > 1e-4f || wVoc > 1e-4f || tMix < 1.f)) {
+                const double sp = pos * stRatio;
+                int64_t j0 = (int64_t)sp;
+                if (j0 > stFrames - 2) j0 = std::max<int64_t>(0, stFrames - 2);
+                const float sf = (float)std::min(1.0, std::max(0.0, sp - (double)j0));
+                const int16_t* iv = st->inst.data();
+                const int16_t* vv = st->voc.data();
+                const float il = (iv[j0 * 2] + (iv[j0 * 2 + 2] - iv[j0 * 2]) * sf) * k;
+                const float ir = (iv[j0 * 2 + 1] + (iv[j0 * 2 + 3] - iv[j0 * 2 + 1]) * sf) * k;
+                const float vl = (vv[j0 * 2] + (vv[j0 * 2 + 2] - vv[j0 * 2]) * sf) * k;
+                const float vr = (vv[j0 * 2 + 1] + (vv[j0 * 2 + 3] - vv[j0 * 2 + 1]) * sf) * k;
+                l = l * wMix + (il * wInst + vl * wVoc) * g;
+                r = r * wMix + (ir * wInst + vr * wVoc) * g;
+            } else if (wMix < 0.9999f) {
+                l *= wMix; r *= wMix;
+            }
             tmp[2 * i] = l;
             tmp[2 * i + 1] = r;
         }
         d.pos = pos;
         d.rate = rate;
+        d.wMix = wMix; d.wInst = wInst; d.wVoc = wVoc;
         d.position.store(pos);
 
-        d.vocal.process(tmp, n, (float)outRate_, d.vocalMode.load());   // antes del EQ
+        d.vocal.process(tmp, n, (float)outRate_, useStems ? 0 : vmode);   // antes del EQ
         d.fx.process(tmp, n, (float)outRate_, d.eqLow.load(), d.eqMid.load(), d.eqHigh.load(),
                      d.filter.load());
 
@@ -279,6 +321,7 @@ static bool publishLoading(Deck& d) {
     std::shared_ptr<Track> t = d.loading;
     if (!t || d.published || t->avail.load() < 2) return false;
     d.published = true;
+    std::atomic_store(&d.stems, std::shared_ptr<Stems>());      // los stems eran de la pista anterior
     d.loopOn.store(false);
     d.playing.store(false);
     d.cuePreview.store(false);
@@ -622,4 +665,133 @@ JNI(jfloat, syncDeck)(JNIEnv*, jobject, jint deck) {
         gEngine->seekFrames(deck, (posD - diff * perD) * tr->sampleRate);
     }
     return r;
+}
+
+// ---- separacion de voz con IA (modelo MDX-Net en Kotlin/ONNX Runtime; aqui solo la parte de senal) ----
+namespace {
+
+struct SepSession {
+    std::vector<int16_t> mix, voc;   // estereo intercalado a 44.1 kHz
+    int srcRate = 44100;
+    int64_t frames = 0;
+};
+std::unique_ptr<SepSession> gSep;
+constexpr int kGen = sep::kChunk - 2 * sep::kTrim;
+
+bool writeAll(const std::string& path, const std::vector<int16_t>& v) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(v.data(), 2, v.size(), f) == v.size();
+    return std::fclose(f) == 0 && ok;
+}
+bool readAll(const std::string& path, std::vector<int16_t>& v) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || (sz % 4) != 0) { std::fclose(f); return false; }
+    v.resize((size_t)sz / 2);
+    const bool ok = std::fread(v.data(), 2, v.size(), f) == v.size();
+    std::fclose(f);
+    return ok;
+}
+std::string jstr(JNIEnv* env, jstring s) {
+    const char* c = env->GetStringUTFChars(s, nullptr);
+    std::string r = c ? c : "";
+    if (c) env->ReleaseStringUTFChars(s, c);
+    return r;
+}
+
+}  // namespace
+
+JNI(void, sepBegin)(JNIEnv*, jobject, jint estFrames, jint srcRate) {
+    gSep = std::make_unique<SepSession>();
+    gSep->srcRate = srcRate > 0 ? srcRate : 44100;
+    if (estFrames > 0) gSep->mix.reserve((size_t)estFrames * 2);
+}
+JNI(void, sepAppend)(JNIEnv* env, jobject, jshortArray arr, jint frames) {
+    if (!gSep || frames <= 0) return;
+    const size_t old = gSep->mix.size();
+    gSep->mix.resize(old + (size_t)frames * 2);
+    env->GetShortArrayRegion(arr, 0, frames * 2, gSep->mix.data() + old);
+}
+// Termina la carga: pasa a 44.1 kHz si hace falta. Devuelve la cantidad de bloques de IA a procesar (0 = error).
+JNI(jint, sepPrepare)(JNIEnv*, jobject) {
+    if (!gSep || gSep->mix.size() < 4) return 0;
+    int64_t frames = (int64_t)(gSep->mix.size() / 2);
+    if (gSep->srcRate != 44100) {
+        std::vector<int16_t> r = sep::resampleStereo(gSep->mix.data(), frames, gSep->srcRate, 44100);
+        gSep->mix.swap(r);
+        std::vector<int16_t>().swap(r);
+        frames = (int64_t)(gSep->mix.size() / 2);
+    }
+    gSep->frames = frames;
+    gSep->voc.assign((size_t)frames * 2, 0);
+    return (jint)((frames + kGen - 1) / kGen);
+}
+// Calcula la STFT del bloque idx y la deja en el buffer directo `out` (4*3072*256 floats).
+JNI(jboolean, sepStft)(JNIEnv* env, jobject, jint idx, jobject out) {
+    if (!gSep || gSep->frames <= 0 || out == nullptr) return JNI_FALSE;
+    float* p = static_cast<float*>(env->GetDirectBufferAddress(out));
+    if (!p || env->GetDirectBufferCapacity(out) < (jlong)(4LL * sep::kDimF * sep::kDimT * 4)) return JNI_FALSE;
+    sep::stftChunk(gSep->mix.data(), gSep->frames, (int64_t)idx * kGen - sep::kTrim, p);
+    return JNI_TRUE;
+}
+// Recibe la salida del modelo del bloque idx (4*3072*256 floats), hace la ISTFT y guarda la voz de ese tramo.
+JNI(jboolean, sepIstft)(JNIEnv* env, jobject, jint idx, jfloatArray model) {
+    if (!gSep || gSep->frames <= 0) return JNI_FALSE;
+    if (env->GetArrayLength(model) < 4 * sep::kDimF * sep::kDimT) return JNI_FALSE;
+    static std::vector<float> out;
+    out.resize((size_t)2 * sep::kChunk);
+    jfloat* m = env->GetFloatArrayElements(model, nullptr);
+    if (!m) return JNI_FALSE;
+    sep::istftChunk(m, out.data());
+    env->ReleaseFloatArrayElements(model, m, JNI_ABORT);
+    const int64_t start = (int64_t)idx * kGen;
+    const int64_t n = std::min<int64_t>(kGen, gSep->frames - start);
+    for (int ch = 0; ch < 2; ++ch) {
+        const float* o = out.data() + (size_t)ch * sep::kChunk + sep::kTrim;
+        for (int64_t j = 0; j < n; ++j) {
+            const float v = std::clamp(o[j] * 1.009f, -1.f, 1.f);
+            gSep->voc[(size_t)(start + j) * 2 + ch] = (int16_t)std::lrintf(v * 32767.f);
+        }
+    }
+    return JNI_TRUE;
+}
+// Guarda voz.pcm e instrumental.pcm (instrumental = mezcla - voz) y libera la sesion.
+JNI(jboolean, sepFinish)(JNIEnv* env, jobject, jstring vocPath, jstring instPath) {
+    if (!gSep) return JNI_FALSE;
+    std::unique_ptr<SepSession> s = std::move(gSep);
+    const size_t n = s->mix.size();
+    std::vector<int16_t> inst(n);
+    for (size_t i = 0; i < n; ++i) {
+        inst[i] = (int16_t)std::clamp((int)s->mix[i] - (int)s->voc[i], -32768, 32767);
+    }
+    return writeAll(jstr(env, vocPath), s->voc) && writeAll(jstr(env, instPath), inst) ? JNI_TRUE : JNI_FALSE;
+}
+JNI(void, sepCancel)(JNIEnv*, jobject) { gSep.reset(); }
+
+// ---- stems de IA en un deck ----
+JNI(jboolean, stemLoad)(JNIEnv* env, jobject, jint deck, jstring vocPath, jstring instPath) {
+    if (!validDeck(deck)) return JNI_FALSE;
+    Deck& d = gEngine->decks[deck];
+    std::shared_ptr<Track> t = std::atomic_load(&d.track);
+    if (!t) return JNI_FALSE;
+    auto st = std::make_shared<Stems>();
+    if (!readAll(jstr(env, vocPath), st->voc) || !readAll(jstr(env, instPath), st->inst)) return JNI_FALSE;
+    if (st->voc.size() != st->inst.size()) return JNI_FALSE;
+    st->owner = t.get();
+    std::atomic_store(&d.stems, st);
+    return JNI_TRUE;
+}
+JNI(void, stemClear)(JNIEnv*, jobject, jint deck) {
+    if (validDeck(deck)) std::atomic_store(&gEngine->decks[deck].stems, std::shared_ptr<Stems>());
+}
+JNI(jboolean, hasStems)(JNIEnv*, jobject, jint deck) {
+    if (!validDeck(deck)) return JNI_FALSE;
+    Deck& d = gEngine->decks[deck];
+    std::shared_ptr<Stems> st = std::atomic_load(&d.stems);
+    std::shared_ptr<Track> t = std::atomic_load(&d.track);
+    return st && t && st->owner == t.get() ? JNI_TRUE : JNI_FALSE;
 }

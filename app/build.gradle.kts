@@ -12,8 +12,8 @@ android {
         applicationId = "cl.fernando.djnube"
         minSdk = 26
         targetSdk = 35
-        versionCode = 16
-        versionName = "0.10.1"
+        versionCode = 17
+        versionName = "0.11.0"
 
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
         externalNativeBuild {
@@ -41,12 +41,14 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    packaging { jniLibs.pickFirsts += "**/libc++_shared.so" }
 }
 
 dependencies {
     implementation("com.google.oboe:oboe:1.9.3")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation(platform("androidx.compose:compose-bom:2024.10.01"))
     implementation("androidx.compose.ui:ui")

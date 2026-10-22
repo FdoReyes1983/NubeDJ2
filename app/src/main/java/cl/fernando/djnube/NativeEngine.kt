@@ -57,4 +57,20 @@ object NativeEngine {
      * Devuelve el nuevo factor de tempo (1.0 = sin cambio) o -1 si falta el BPM de alguno de los decks.
      */
     external fun syncDeck(deck: Int): Float
+
+    // ---- separacion de voz con IA (ver Separator.kt) ----
+    external fun sepBegin(estFrames: Int, srcRate: Int)
+    external fun sepAppend(pcm: ShortArray, frames: Int)
+    /** Termina la lectura (pasa a 44.1 kHz) y devuelve cuantos bloques de IA hay que procesar; 0 = error. */
+    external fun sepPrepare(): Int
+    /** STFT del bloque [idx] en un buffer directo de 4*3072*256 floats. */
+    external fun sepStft(idx: Int, out: java.nio.ByteBuffer): Boolean
+    /** ISTFT de la salida del modelo para el bloque [idx]; guarda la voz de ese tramo. */
+    external fun sepIstft(idx: Int, model: FloatArray): Boolean
+    external fun sepFinish(vocPath: String, instPath: String): Boolean
+    external fun sepCancel()
+    /** Stems de IA de la pista cargada en el deck (si existen, SIN VOZ / SOLO VOZ los usan). */
+    external fun stemLoad(deck: Int, vocPath: String, instPath: String): Boolean
+    external fun stemClear(deck: Int)
+    external fun hasStems(deck: Int): Boolean
 }
