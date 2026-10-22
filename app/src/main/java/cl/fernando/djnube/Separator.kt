@@ -26,7 +26,6 @@ object Separator {
     private var env: OrtEnvironment? = null
     private var vocals: OrtSession? = null
     private var accomp: OrtSession? = null
-    private var warned = false
 
     private const val COUNT = 2 * 512 * 1024         // floats por bloque (2 canales x 512 cuadros x 1024 bins)
 
@@ -57,8 +56,11 @@ object Separator {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
-                if (d.loadGen == gen) d.stemProg = -1f
-                if (!warned) { warned = true; say("IA no disponible: ${e.message ?: e.javaClass.simpleName}") }
+                if (d.loadGen == gen) {
+                    d.stemProg = -1f
+                    val where = e.stackTrace.firstOrNull()?.let { " @${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" } ?: ""
+                    d.stemErr = ("${e.javaClass.simpleName}: ${e.message ?: "?"}$where").take(160)
+                }
             }
         }
     }
@@ -68,7 +70,8 @@ object Separator {
         val (sv, sa) = sessions(ctx)
         val deck = d.index
         val n = NativeEngine.stemPrepare(deck)
-        if (n <= 0) { if (d.loadGen == gen) d.stemProg = -1f; return }
+        if (n <= 0) error("la pista no estaba lista para separar (stemPrepare=0)")
+        val t0 = android.os.SystemClock.elapsedRealtime()
         try {
             val e = env!!
             val inB = ByteBuffer.allocateDirect(COUNT * 4).order(ByteOrder.nativeOrder())
@@ -81,7 +84,7 @@ object Separator {
             for (p in 0 until n) {
                 currentCoroutineContext().ensureActive()
                 if (d.loadGen != gen) return                      // se cargo otra pista en el deck
-                check(NativeEngine.stemInput(deck, p, inB)) { "STFT" }
+                check(NativeEngine.stemInput(deck, p, inB)) { "fallo la STFT nativa" }
                 for ((sess, dst) in listOf(sv to outVF, sa to outAF)) {
                     inF.rewind()
                     OnnxTensor.createTensor(e, inF, shape).use { tin ->
@@ -93,9 +96,10 @@ object Separator {
                         }
                     }
                 }
-                check(NativeEngine.stemApply(deck, p, outVB, outAB)) { "ISTFT" }
+                check(NativeEngine.stemApply(deck, p, outVB, outAB)) { "la salida de la IA no es valida (NaN) o fallo la ISTFT" }
                 d.stemProg = (p + 1f) / n
             }
+            d.stemSecs = (android.os.SystemClock.elapsedRealtime() - t0) / 1000f
         } finally {
             NativeEngine.stemEnd(deck)
         }

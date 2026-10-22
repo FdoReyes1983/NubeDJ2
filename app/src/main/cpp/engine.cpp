@@ -725,8 +725,7 @@ JNI(jboolean, stemApply)(JNIEnv* env, jobject, jint deck, jint p, jobject yv, jo
     const float* v = static_cast<const float*>(env->GetDirectBufferAddress(yv));
     const float* a = static_cast<const float*>(env->GetDirectBufferAddress(ya));
     if (!v || !a) return JNI_FALSE;
-    gJobs[deck]->job->apply(p, v, a);
-    return JNI_TRUE;
+    return gJobs[deck]->job->apply(p, v, a) ? JNI_TRUE : JNI_FALSE;
 }
 JNI(void, stemEnd)(JNIEnv*, jobject, jint deck) {
     if (validDeck(deck)) gJobs[deck].reset();      // el motor conserva los stems ya entregados (comparte su memoria)

@@ -12,8 +12,8 @@ android {
         applicationId = "cl.fernando.djnube"
         minSdk = 26
         targetSdk = 35
-        versionCode = 18
-        versionName = "0.12.0"
+        versionCode = 19
+        versionName = "0.12.1"
 
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
         externalNativeBuild {

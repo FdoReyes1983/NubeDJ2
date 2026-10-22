@@ -97,6 +97,8 @@ class DeckState(val index: Int) {
     var vocal by mutableIntStateOf(0)           // 0 normal, 1 sin voz, 2 solo voz
     var stemProg by mutableFloatStateOf(-1f)    // IA: -1 sin separar, 0..1 avance de la separacion voz/instrumental
     var stemJob: kotlinx.coroutines.Job? = null
+    var stemErr by mutableStateOf("")            // por que fallo la IA en esta pista ("" = sin error)
+    var stemSecs by mutableFloatStateOf(0f)     // cuanto tardo la separacion completa
     val stems: Boolean get() = stemProg >= 0.999f
     var fxX by mutableFloatStateOf(0.5f)
     var fxY by mutableFloatStateOf(0.5f)
@@ -330,6 +332,7 @@ fun DjApp() {
                     d.analyzing = false
                     d.stemJob?.cancel()
                     d.stemProg = -1f
+                    d.stemErr = ""
                     d.pendingSync = false
                     d.loopBeats = 0f
                     d.detail = null
@@ -592,6 +595,14 @@ fun DjApp() {
                     running = mixRunning, onGo = startMix, onClose = { mixOpen = false }
                 )
             }
+            decks.firstOrNull { it.stemErr.isNotEmpty() }?.let { dk ->
+                Text(
+                    "IA ${deckLetter(dk)} fallo: ${dk.stemErr}  (toca para ocultar)", color = Color.White, fontSize = 11.sp,
+                    modifier = Modifier.align(Alignment.TopCenter).padding(12.dp)
+                        .clip(RoundedCornerShape(8.dp)).background(Color(0xFF7A1C1C))
+                        .clickable { dk.stemErr = "" }.padding(horizontal = 12.dp, vertical = 8.dp)
+                )
+            }
             message?.let {
                 Text(
                     it, color = Color.White, fontSize = 13.sp,
@@ -719,6 +730,15 @@ fun DeckHeader(d: DeckState, accent: Color, modifier: Modifier, onLoad: () -> Un
             color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f)
         )
+        val iaChip = when {
+            d.stemErr.isNotEmpty() -> "IA X"
+            d.stems -> "IA OK ${"%.0f".format(d.stemSecs)}s"
+            d.stemProg >= 0f -> "IA ${(d.stemProg * 100).toInt()}%"
+            else -> ""
+        }
+        if (iaChip.isNotEmpty()) {
+            Text(iaChip, color = if (d.stemErr.isNotEmpty()) RED else GREEN, fontSize = 10.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+        }
         if (d.vocal != 0) {
             Text((if (d.vocal == 1) "SIN VOZ" else "SOLO VOZ") + (if (d.stems) " IA" else if (d.stemProg >= 0f) " IA ${(d.stemProg * 100).toInt()}%" else ""), color = GREEN, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1)
         }
@@ -1210,10 +1230,10 @@ private fun setVocal(d: DeckState, mode: Int, say: (String) -> Unit) {
         when (d.vocal) {
             1 -> if (d.stems) "Deck ${deckLetter(d)}: SIN VOZ con IA (solo el instrumental)"
                  else if (d.stemProg >= 0f) "Deck ${deckLetter(d)}: SIN VOZ rapido; la IA va en ${(d.stemProg * 100).toInt()}% y entra sola al terminar"
-                 else "Deck ${deckLetter(d)}: SIN VOZ rapido (la IA no esta disponible para esta pista)"
+                 else "Deck ${deckLetter(d)}: SIN VOZ rapido (IA no disponible: ${d.stemErr.ifEmpty { "sin motivo" }})"
             2 -> if (d.stems) "Deck ${deckLetter(d)}: SOLO VOZ con IA (solo la voz)"
                  else if (d.stemProg >= 0f) "Deck ${deckLetter(d)}: SOLO VOZ rapido; la IA va en ${(d.stemProg * 100).toInt()}% y entra sola al terminar"
-                 else "Deck ${deckLetter(d)}: SOLO VOZ rapido (la IA no esta disponible para esta pista)"
+                 else "Deck ${deckLetter(d)}: SOLO VOZ rapido (IA no disponible: ${d.stemErr.ifEmpty { "sin motivo" }})"
             else -> "Deck ${deckLetter(d)}: voz normal"
         }
     )

@@ -100,7 +100,14 @@ public:
     }
 
     // yv, ya: salida de los modelos vocals / accompaniment para el bloque p ([2][kFr][kBins]).
-    void apply(int p, const float* yv, const float* ya) {
+    // Devuelve false si la salida trae NaN/Inf (comprobado por bits: -ffast-math no deja usar isfinite).
+    bool apply(int p, const float* yv, const float* ya) {
+        for (size_t i = 0; i < (size_t)2 * kFr * kBins; ++i) {
+            uint32_t a, b;
+            std::memcpy(&a, yv + i, 4);
+            std::memcpy(&b, ya + i, 4);
+            if ((a & 0x7f800000u) == 0x7f800000u || (b & 0x7f800000u) == 0x7f800000u) return false;
+        }
         const Fft& fft = plan();
         const std::vector<float>& win = window();
         const int real = std::min(kFr, nFrames_ - p * kFr);
@@ -135,6 +142,7 @@ public:
             }
         }
         finalize(p);
+        return true;
     }
 
 private:
