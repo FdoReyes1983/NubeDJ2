@@ -667,7 +667,7 @@ fun PortraitLayout(
                         Box(Modifier.weight(1f).fillMaxHeight()) {
                             when (tab) {
                                 1 -> LoopPad(x, say)
-                                2 -> FxPad(x, accent(x))
+                                2 -> FxPad(x, accent(x), say)
                                 else -> DeckControls(x, accent(x), if (sel == 2) 2 else 1)
                             }
                         }
@@ -713,6 +713,9 @@ fun DeckHeader(d: DeckState, accent: Color, modifier: Modifier, onLoad: () -> Un
             color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f)
         )
+        if (d.vocal != 0) {
+            Text(if (d.vocal == 1) "SIN VOZ" else "SOLO VOZ", color = GREEN, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+        }
         Text(
             if (d.bpm > 0f) "%.1f".format(d.bpm * (1f + d.tempoPct / 100f)) else if (d.analyzing) "…" else "--",
             color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold
@@ -732,7 +735,7 @@ fun DeckArea(d: DeckState, other: DeckState, accent: Color, mode: Int, modifier:
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (mode) {
                 1 -> LoopPad(d, say)
-                2 -> FxPad(d, accent)
+                2 -> FxPad(d, accent, say)
                 else -> DeckControls(d, accent)
             }
         }
@@ -1194,11 +1197,23 @@ fun LoopPad(d: DeckState, say: (String) -> Unit) {
 
 private val FX_NAMES = listOf("", "ECO", "REVERB", "FLANGER", "PHASER", "GATE")
 
+private fun setVocal(d: DeckState, mode: Int, say: (String) -> Unit) {
+    d.vocal = if (d.vocal == mode) 0 else mode
+    NativeEngine.setVocal(d.index, d.vocal)
+    say(
+        when (d.vocal) {
+            1 -> "Deck ${deckLetter(d)}: SIN VOZ activado (quita lo que esta al centro de la mezcla)"
+            2 -> "Deck ${deckLetter(d)}: SOLO VOZ activado (deja solo lo que esta al centro)"
+            else -> "Deck ${deckLetter(d)}: voz normal"
+        }
+    )
+}
+
 private fun pushFx(d: DeckState) = NativeEngine.setFx(d.index, d.fxType, d.fxTouch || d.fxLock, d.fxX, d.fxY)
 
 /** Selector de efecto + pad XY: X = tiempo/velocidad, Y = cantidad. Tocar el pad lo activa; LOCK lo deja encendido. */
 @Composable
-fun FxPad(d: DeckState, accent: Color) {
+fun FxPad(d: DeckState, accent: Color, say: (String) -> Unit) {
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(3.dp)) {
         for (row in 0 until 2) {
             Row(Modifier.fillMaxWidth().height(22.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -1219,14 +1234,8 @@ fun FxPad(d: DeckState, accent: Color) {
             }
         }
         Row(Modifier.fillMaxWidth().height(22.dp), horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-            SmallButton("SIN VOZ", GREEN, Modifier.weight(1f).fillMaxHeight(), filled = d.vocal == 1) {
-                d.vocal = if (d.vocal == 1) 0 else 1
-                NativeEngine.setVocal(d.index, d.vocal)
-            }
-            SmallButton("SOLO VOZ", GREEN, Modifier.weight(1f).fillMaxHeight(), filled = d.vocal == 2) {
-                d.vocal = if (d.vocal == 2) 0 else 2
-                NativeEngine.setVocal(d.index, d.vocal)
-            }
+            SmallButton("SIN VOZ", GREEN, Modifier.weight(1f).fillMaxHeight(), filled = d.vocal == 1) { setVocal(d, 1, say) }
+            SmallButton("SOLO VOZ", GREEN, Modifier.weight(1f).fillMaxHeight(), filled = d.vocal == 2) { setVocal(d, 2, say) }
         }
         Canvas(
             Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(Color(0xFF0B1220))
