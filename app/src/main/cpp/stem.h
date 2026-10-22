@@ -99,14 +99,13 @@ public:
         }
     }
 
-    // yv, ya: salida de los modelos vocals / accompaniment para el bloque p ([2][kFr][kBins]).
+    // yv: salida del modelo de voz para el bloque p ([2][kFr][kBins]): magnitud estimada de la voz.
     // Devuelve false si la salida trae NaN/Inf (comprobado por bits: -ffast-math no deja usar isfinite).
-    bool apply(int p, const float* yv, const float* ya) {
+    bool apply(int p, const float* yv) {
         for (size_t i = 0; i < (size_t)2 * kFr * kBins; ++i) {
-            uint32_t a, b;
+            uint32_t a;
             std::memcpy(&a, yv + i, 4);
-            std::memcpy(&b, ya + i, 4);
-            if ((a & 0x7f800000u) == 0x7f800000u || (b & 0x7f800000u) == 0x7f800000u) return false;
+            if ((a & 0x7f800000u) == 0x7f800000u) return false;
         }
         const Fft& fft = plan();
         const std::vector<float>& win = window();
@@ -116,11 +115,10 @@ public:
         for (int ch = 0; ch < 2; ++ch) {
             for (int t = 0; t < real; ++t) {
                 const float* v = yv + ((size_t)ch * kFr + t) * kBins;
-                const float* a = ya + ((size_t)ch * kFr + t) * kBins;
+                const cpx* sp0 = &spec_[ch][(size_t)t * kHalf];
                 double msum = 0.0;
-                for (int f = 0; f < kBins; ++f) {
-                    const float vv = v[f] * v[f], aa = a[f] * a[f];
-                    mask[f] = vv / (vv + aa + 1e-10f);
+                for (int f = 0; f < kBins; ++f) {       // mascara = voz estimada / mezcla, entre 0 y 1
+                    mask[f] = std::clamp(v[f] / (std::abs(sp0[f]) + 1e-8f), 0.f, 1.f);
                     msum += mask[f];
                 }
                 const float fill = (float)(msum / kBins);

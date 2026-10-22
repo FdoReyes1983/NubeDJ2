@@ -719,13 +719,12 @@ JNI(jboolean, stemInput)(JNIEnv* env, jobject, jint deck, jint p, jobject out) {
     gJobs[deck]->job->input(p, o);
     return JNI_TRUE;
 }
-// Salida de los dos modelos (voz y acompanamiento, buffers directos) para el bloque p: mascara, ISTFT y entrega.
-JNI(jboolean, stemApply)(JNIEnv* env, jobject, jint deck, jint p, jobject yv, jobject ya) {
-    if (!validDeck(deck) || !gJobs[deck] || !yv || !ya) return JNI_FALSE;
+// Salida del modelo de voz (buffer directo) para el bloque p: mascara, ISTFT y entrega.
+JNI(jboolean, stemApply)(JNIEnv* env, jobject, jint deck, jint p, jobject yv) {
+    if (!validDeck(deck) || !gJobs[deck] || !yv) return JNI_FALSE;
     const float* v = static_cast<const float*>(env->GetDirectBufferAddress(yv));
-    const float* a = static_cast<const float*>(env->GetDirectBufferAddress(ya));
-    if (!v || !a) return JNI_FALSE;
-    return gJobs[deck]->job->apply(p, v, a) ? JNI_TRUE : JNI_FALSE;
+    if (!v || env->GetDirectBufferCapacity(yv) < (jlong)(2LL * stem::kFr * stem::kBins * 4)) return JNI_FALSE;
+    return gJobs[deck]->job->apply(p, v) ? JNI_TRUE : JNI_FALSE;
 }
 JNI(void, stemEnd)(JNIEnv*, jobject, jint deck) {
     if (validDeck(deck)) gJobs[deck].reset();      // el motor conserva los stems ya entregados (comparte su memoria)

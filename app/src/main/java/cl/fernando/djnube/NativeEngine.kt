@@ -63,8 +63,8 @@ object NativeEngine {
     external fun stemPrepare(deck: Int): Int
     /** STFT del bloque [p]: magnitudes en un buffer directo de 2*512*1024 floats. */
     external fun stemInput(deck: Int, p: Int, out: java.nio.ByteBuffer): Boolean
-    /** Salida de los modelos voz / acompanamiento (buffers directos) para el bloque [p]. */
-    external fun stemApply(deck: Int, p: Int, yVocals: java.nio.ByteBuffer, yAccomp: java.nio.ByteBuffer): Boolean
+    /** Salida del modelo de voz (buffer directo) para el bloque [p]. */
+    external fun stemApply(deck: Int, p: Int, yVocals: java.nio.ByteBuffer): Boolean
     external fun stemEnd(deck: Int)
     external fun stemClear(deck: Int)
     /** Fraccion ya separada de la pista del deck (0..1); -1 si no hay stems. */

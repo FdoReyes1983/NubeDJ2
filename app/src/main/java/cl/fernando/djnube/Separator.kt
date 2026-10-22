@@ -25,11 +25,10 @@ object Separator {
     private val lock = Mutex()                       // un deck a la vez
     private var env: OrtEnvironment? = null
     private var vocals: OrtSession? = null
-    private var accomp: OrtSession? = null
 
     private const val COUNT = 2 * 512 * 1024         // floats por bloque (2 canales x 512 cuadros x 1024 bins)
 
-    private fun sessions(ctx: Context): Pair<OrtSession, OrtSession> {
+    private fun session(ctx: Context): OrtSession {
         val e = env ?: OrtEnvironment.getEnvironment().also { env = it }
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
         fun open(name: String): OrtSession {
@@ -39,9 +38,7 @@ object Separator {
                 e.createSession(bytes, o)
             }
         }
-        val v = vocals ?: open("vocals").also { vocals = it }
-        val a = accomp ?: open("accompaniment").also { accomp = it }
-        return v to a
+        return vocals ?: open("vocals").also { vocals = it }
     }
 
     /** Lanza la separacion de la pista ya cargada en [d] (cancela la anterior de ese deck). */
@@ -67,7 +64,7 @@ object Separator {
 
     private suspend fun separate(ctx: Context, d: DeckState, gen: Int) {
         if (d.loadGen != gen) return
-        val (sv, sa) = sessions(ctx)
+        val sv = session(ctx)
         val deck = d.index
         val n = NativeEngine.stemPrepare(deck)
         if (n <= 0) error("la pista no estaba lista para separar (stemPrepare=0)")
@@ -76,27 +73,23 @@ object Separator {
             val e = env!!
             val inB = ByteBuffer.allocateDirect(COUNT * 4).order(ByteOrder.nativeOrder())
             val outVB = ByteBuffer.allocateDirect(COUNT * 4).order(ByteOrder.nativeOrder())
-            val outAB = ByteBuffer.allocateDirect(COUNT * 4).order(ByteOrder.nativeOrder())
             val inF = inB.asFloatBuffer()
             val outVF = outVB.asFloatBuffer()
-            val outAF = outAB.asFloatBuffer()
             val shape = longArrayOf(2, 1, 512, 1024)
             for (p in 0 until n) {
                 currentCoroutineContext().ensureActive()
                 if (d.loadGen != gen) return                      // se cargo otra pista en el deck
                 check(NativeEngine.stemInput(deck, p, inB)) { "fallo la STFT nativa" }
-                for ((sess, dst) in listOf(sv to outVF, sa to outAF)) {
-                    inF.rewind()
-                    OnnxTensor.createTensor(e, inF, shape).use { tin ->
-                        sess.run(mapOf("x" to tin)).use { res ->
-                            val fb = (res[0] as OnnxTensor).floatBuffer
-                            fb.rewind()
-                            dst.clear()
-                            dst.put(fb)
-                        }
+                inF.rewind()
+                OnnxTensor.createTensor(e, inF, shape).use { tin ->
+                    sv.run(mapOf("x" to tin)).use { res ->
+                        val fb = (res[0] as OnnxTensor).floatBuffer
+                        fb.rewind()
+                        outVF.clear()
+                        outVF.put(fb)
                     }
                 }
-                check(NativeEngine.stemApply(deck, p, outVB, outAB)) { "la salida de la IA no es valida (NaN) o fallo la ISTFT" }
+                check(NativeEngine.stemApply(deck, p, outVB)) { "la salida de la IA no es valida (NaN) o fallo la ISTFT" }
                 d.stemProg = (p + 1f) / n
             }
             d.stemSecs = (android.os.SystemClock.elapsedRealtime() - t0) / 1000f
